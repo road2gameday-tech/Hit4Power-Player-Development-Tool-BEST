@@ -1,366 +1,422 @@
+# app/main.py
 import os
-import secrets
+import sqlite3
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Request, Form, Depends, HTTPException, Response
-from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
+from fastapi import FastAPI, Request, Form, Depends
+from fastapi import Response
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.status import HTTP_303_SEE_OTHER
-from jinja2 import Environment
-from fastapi.templating import Jinja2Templates
+from starlette.templating import Jinja2Templates
 
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Boolean, DateTime, Float,
-    ForeignKey, Text, select, func, text
-)
-from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session as SASession
-
-# --------------------------------------------------------------------------------------
-# Config & app
-# --------------------------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# App & Templating
+# -----------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.dirname(BASE_DIR)
-
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
-# If Render variable points to Postgres, you could swap for a PG engine here.
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-
-engine = create_engine(DATABASE_URL, echo=False, future=True, connect_args=connect_args)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-Base = declarative_base()
+DB_PATH = os.environ.get("DATABASE_PATH", os.path.join(BASE_DIR, "app.db"))
+SECRET_KEY = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
 
 app = FastAPI(title="Hit4Power")
-
-# sessions for simple auth
-SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
-
-# static & templates
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
-# Jinja filters (used by your templates)
-def _datetimeformat(value, fmt="%b %d, %Y"):
+def datetimeformat(value: Any) -> str:
+    """Jinja filter for nice date/time printouts."""
     if not value:
         return ""
-    if isinstance(value, (datetime, date)):
-        return value.strftime(fmt)
-    # try parsing common formats
     try:
-        dt = datetime.fromisoformat(str(value))
-        return dt.strftime(fmt)
+        if isinstance(value, (datetime, date)):
+            dt = value if isinstance(value, datetime) else datetime.combine(value, datetime.min.time())
+        else:
+            # Accept ISO strings
+            dt = datetime.fromisoformat(str(value))
+        return dt.strftime("%b %d, %Y %I:%M %p")
     except Exception:
         return str(value)
 
-def _dateonly(value):
-    if not value:
-        return ""
-    if isinstance(value, (datetime, date)):
-        return value.strftime("%Y-%m-%d")
-    try:
-        dt = datetime.fromisoformat(str(value))
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return str(value)
+templates.env.filters["datetimeformat"] = datetimeformat
 
-templates.env.filters["datetimeformat"] = _datetimeformat
-templates.env.filters["dateonly"] = _dateonly
+# -----------------------------------------------------------------------------
+# DB utils & schema
+# -----------------------------------------------------------------------------
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# --------------------------------------------------------------------------------------
-# Models
-# --------------------------------------------------------------------------------------
+def col_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(r["name"] == column for r in cur.fetchall())
 
-class Player(Base):
-    __tablename__ = "players"
-    id = Column(Integer, primary_key=True)
-    name = Column(String(200), nullable=False)
-    login_code = Column(String(20), unique=True, nullable=True)
-    image_path = Column(String(500), nullable=True)
-    favorited = Column(Boolean, default=False)  # used by /favorite/{id}
-    created_at = Column(DateTime, default=datetime.utcnow)
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
 
-    metrics = relationship("Metric", back_populates="player", cascade="all, delete-orphan")
-    notes = relationship("Note", back_populates="player", cascade="all, delete-orphan")
-    assignments = relationship("DrillAssignment", back_populates="player", cascade="all, delete-orphan")
+def ensure_schema() -> None:
+    conn = get_db()
+    cur = conn.cursor()
 
+    # players
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            login_code TEXT UNIQUE,
+            image_path TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+    """)
 
-class Metric(Base):
-    __tablename__ = "metrics"
-    id = Column(Integer, primary_key=True)
-    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
+    # instructors (one default instructor)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS instructors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    # seed default instructor if none
+    cur.execute("SELECT COUNT(*) AS c FROM instructors")
+    if cur.fetchone()["c"] == 0:
+        cur.execute("INSERT INTO instructors (name, email) VALUES (?, ?)", ("Coach", "coach@example.com"))
 
-    # canonical columns used by UI
-    recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
-    exit_velocity = Column(Float, nullable=True)
-    launch_angle = Column(Float, nullable=True)
-    spin_rate = Column(Float, nullable=True)
+    # favorites
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            instructor_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            PRIMARY KEY (instructor_id, player_id),
+            FOREIGN KEY (instructor_id) REFERENCES instructors(id),
+            FOREIGN KEY (player_id) REFERENCES players(id)
+        );
+    """)
 
-    # extra columns your logs indicated might be referenced elsewhere
-    metric = Column(String(100), nullable=True)
-    value = Column(Float, nullable=True)
-    unit = Column(String(50), nullable=True)
-    source = Column(String(100), nullable=True)
-    entered_by_instructor_id = Column(Integer, nullable=True)
-    note = Column(Text, nullable=True)
+    # notes
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            instructor_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            shared INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    # add kind column if missing (some templates used it earlier)
+    if not col_exists(conn, "notes", "kind"):
+        cur.execute("ALTER TABLE notes ADD COLUMN kind TEXT")
 
-    player = relationship("Player", back_populates="metrics")
+    # drills (library)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS drills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    # seed a couple of drills if empty
+    cur.execute("SELECT COUNT(*) AS c FROM drills")
+    if cur.fetchone()["c"] == 0:
+        cur.executemany(
+            "INSERT INTO drills (title, description) VALUES (?, ?)",
+            [
+                ("Med Ball Rotational Throws", "Explosive hip rotation with med ball."),
+                ("One-Handed Tee Work", "Focus on barrel control and path."),
+                ("Step-Back BP", "Load timing and momentum into launch.")
+            ],
+        )
 
+    # drill assignments
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS drill_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            instructor_id INTEGER NOT NULL,
+            drill_id INTEGER NOT NULL,
+            note TEXT,
+            status TEXT DEFAULT 'assigned',
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+    """)
+    # add due_date if missing
+    if not col_exists(conn, "drill_assignments", "due_date"):
+        cur.execute("ALTER TABLE drill_assignments ADD COLUMN due_date TEXT")
 
-class Note(Base):
-    __tablename__ = "notes"
-    id = Column(Integer, primary_key=True)
-    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
-    instructor_id = Column(Integer, nullable=True)
-    text = Column(Text, nullable=False)
-    shared = Column(Boolean, default=False)
-    kind = Column(String(50), default="coach")  # added per earlier error
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    # metrics (generic, tall table: metric -> value)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            metric TEXT,
+            value REAL,
+            unit TEXT,
+            recorded_at TEXT DEFAULT (datetime('now')),
+            source TEXT,
+            entered_by_instructor_id INTEGER,
+            note TEXT
+        );
+    """)
+    # Backfill columns if this DB existed before
+    for col, ddl in [
+        ("metric", "ALTER TABLE metrics ADD COLUMN metric TEXT"),
+        ("value", "ALTER TABLE metrics ADD COLUMN value REAL"),
+        ("unit", "ALTER TABLE metrics ADD COLUMN unit TEXT"),
+        ("source", "ALTER TABLE metrics ADD COLUMN source TEXT"),
+        ("entered_by_instructor_id", "ALTER TABLE metrics ADD COLUMN entered_by_instructor_id INTEGER"),
+        ("note", "ALTER TABLE metrics ADD COLUMN note TEXT"),
+    ]:
+        if not col_exists(conn, "metrics", col):
+            cur.execute(ddl)
 
-    player = relationship("Player", back_populates="notes")
+    # ensure recorded_at has a value
+    cur.execute("UPDATE metrics SET recorded_at = COALESCE(recorded_at, datetime('now')) WHERE recorded_at IS NULL")
 
+    conn.commit()
+    conn.close()
 
-class Drill(Base):
-    __tablename__ = "drills"
-    id = Column(Integer, primary_key=True)
-    title = Column(String(200), nullable=False)
-    description = Column(Text, nullable=True)
+ensure_schema()
 
-    assignments = relationship("DrillAssignment", back_populates="drill", cascade="all, delete-orphan")
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def require_instructor(request: Request) -> int:
+    iid = request.session.get("instructor_id")
+    if not iid:
+        # bounce to home
+        raise RedirectResponse(url="/", status_code=303)
+    return int(iid)
 
+def require_player(request: Request) -> int:
+    pid = request.session.get("player_id")
+    if not pid:
+        raise RedirectResponse(url="/", status_code=303)
+    return int(pid)
 
-class DrillAssignment(Base):
-    __tablename__ = "drill_assignments"
-    id = Column(Integer, primary_key=True)
-    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
-    instructor_id = Column(Integer, nullable=True)
-    drill_id = Column(Integer, ForeignKey("drills.id"), nullable=False)
-    note = Column(Text, nullable=True)
-    status = Column(String(50), default="assigned")
-    due_date = Column(DateTime, nullable=True)  # added per earlier error
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+def ensure_login_code(name: str) -> str:
+    # simple stable code from name + time
+    base = "".join(ch for ch in name.lower() if ch.isalnum())
+    return (base[:3] + datetime.utcnow().strftime("%H%M%S"))[-6:]
 
-    player = relationship("Player", back_populates="assignments")
-    drill = relationship("Drill", back_populates="assignments")
-
-
-# --------------------------------------------------------------------------------------
-# DB helpers
-# --------------------------------------------------------------------------------------
-
-def get_db() -> SASession:
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def _table_has_column(conn, table: str, column: str) -> bool:
-    if not DATABASE_URL.startswith("sqlite"):
-        # For non-sqlite, you'd query information_schema
-        return True
-    res = conn.exec_driver_sql(f"PRAGMA table_info({table});").fetchall()
-    cols = {row[1] for row in res}
-    return column in cols
-
-def ensure_schema():
+def pivot_metrics(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
     """
-    Create tables, then ALTER any missing columns we know templates/routes read from.
-    Also backfill some values to avoid None-related crashes.
+    Turn tall metrics rows (metric, value, recorded_at) into
+    [{date, exit_velocity, launch_angle, spin_rate}, ...] by day.
     """
-    Base.metadata.create_all(bind=engine)
+    by_day: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        rec = r["recorded_at"] or now_iso()
+        try:
+            dkey = datetime.fromisoformat(rec).date().isoformat()
+        except Exception:
+            dkey = str(rec)[:10]
+        if dkey not in by_day:
+            by_day[dkey] = {"date": dkey, "exit_velocity": None, "launch_angle": None, "spin_rate": None}
+        m = (r["metric"] or "").strip().lower()
+        val = r["value"]
+        if m in ("ev", "exit_velocity", "exit-velocity"):
+            by_day[dkey]["exit_velocity"] = val
+        elif m in ("la", "launch_angle", "launch-angle"):
+            by_day[dkey]["launch_angle"] = val
+        elif m in ("sr", "spin_rate", "spin-rate"):
+            by_day[dkey]["spin_rate"] = val
+    out = list(by_day.values())
+    # sort by date
+    out.sort(key=lambda x: x["date"])
+    return out
 
-    with engine.begin() as conn:
-        def _apply(sql: str, label: str):
-            try:
-                conn.exec_driver_sql(sql)
-                print(f"[ensure_schema] {label}")
-            except Exception as _:
-                # column might already exist, ignore
-                pass
-
-        # players.favorited
-        if not _table_has_column(conn, "players", "favorited"):
-            _apply("ALTER TABLE players ADD COLUMN favorited INTEGER DEFAULT 0", "players: added favorited")
-
-        # metrics extended columns
-        if not _table_has_column(conn, "metrics", "metric"):
-            _apply("ALTER TABLE metrics ADD COLUMN metric TEXT", "metrics: added metric")
-        if not _table_has_column(conn, "metrics", "value"):
-            _apply("ALTER TABLE metrics ADD COLUMN value REAL", "metrics: added value")
-        if not _table_has_column(conn, "metrics", "unit"):
-            _apply("ALTER TABLE metrics ADD COLUMN unit TEXT", "metrics: added unit")
-        if not _table_has_column(conn, "metrics", "source"):
-            _apply("ALTER TABLE metrics ADD COLUMN source TEXT", "metrics: added source")
-        if not _table_has_column(conn, "metrics", "entered_by_instructor_id"):
-            _apply("ALTER TABLE metrics ADD COLUMN entered_by_instructor_id INTEGER", "metrics: added entered_by_instructor_id")
-        if not _table_has_column(conn, "metrics", "note"):
-            _apply("ALTER TABLE metrics ADD COLUMN note TEXT", "metrics: added note")
-        if not _table_has_column(conn, "metrics", "recorded_at"):
-            _apply("ALTER TABLE metrics ADD COLUMN recorded_at TIMESTAMP", "metrics: added recorded_at (nullable)")
-            _apply("UPDATE metrics SET recorded_at = COALESCE(recorded_at, CURRENT_TIMESTAMP)", "metrics: backfilled recorded_at")
-
-        # notes.kind
-        if not _table_has_column(conn, "notes", "kind"):
-            _apply("ALTER TABLE notes ADD COLUMN kind TEXT DEFAULT 'coach'", "notes: added kind")
-
-        # drill_assignments.due_date
-        if not _table_has_column(conn, "drill_assignments", "due_date"):
-            _apply("ALTER TABLE drill_assignments ADD COLUMN due_date TIMESTAMP", "drill_assignments: added due_date")
-
-    # Seed a couple drills if empty
-    with SessionLocal() as db:
-        if db.scalar(select(func.count(Drill.id))) == 0:
-            db.add_all([
-                Drill(title="Tee Work — Line Drives", description="Focus on staying through the ball."),
-                Drill(title="Front Toss — Gap to Gap", description="Work on timing and barrel control."),
-                Drill(title="Short Bat — Inside Pitch", description="Quick hands, keep knob inside.")
-            ])
-            db.commit()
-
-def _require_instructor(request: Request):
-    if request.session.get("role") != "instructor":
-        raise HTTPException(status_code=403, detail="Instructor login required")
-
-def _require_player(request: Request):
-    if request.session.get("role") != "player":
-        raise HTTPException(status_code=403, detail="Player login required")
-
-# --------------------------------------------------------------------------------------
-# Health & probe endpoints (for Render/Google)
-# --------------------------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Health / Readiness / Probes (prevents 502 & 405 on HEAD)
+# -----------------------------------------------------------------------------
 @app.get("/health", include_in_schema=False)
 def health():
-    # trivial liveness
     return {"ok": True}
 
 @app.get("/ready", include_in_schema=False)
 def ready():
-    # simple readiness: can we start a DB session?
+    # optionally test DB connectivity
     try:
-        with SessionLocal() as db:
-            db.execute(text("SELECT 1"))
+        conn = get_db()
+        conn.execute("SELECT 1")
+        conn.close()
         return {"ready": True}
     except Exception as e:
         return JSONResponse({"ready": False, "error": str(e)}, status_code=500)
 
 @app.head("/", include_in_schema=False)
 def root_head():
-    # Probes often send HEAD /
     return Response(status_code=200)
 
-# --------------------------------------------------------------------------------------
-# Startup
-# --------------------------------------------------------------------------------------
-
-@app.on_event("startup")
-def on_startup():
-    ensure_schema()
-
-# --------------------------------------------------------------------------------------
-# Basic pages & auth
-# --------------------------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Home / Index (resilient)
+# -----------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+def index(request: Request):
+    try:
+        return templates.TemplateResponse("index.html", {"request": request})
+    except Exception:
+        # Minimal OK page so the LB stops 502’ing while templates settle
+        return HTMLResponse("<h1>Hit4Power</h1><p>App is running.</p>", status_code=200)
 
+# -----------------------------------------------------------------------------
+# Auth (simple session stubs)
+# -----------------------------------------------------------------------------
 @app.post("/login/instructor")
 def login_instructor(request: Request):
-    request.session.clear()
-    request.session["role"] = "instructor"
+    # Trust the form; set instructor 1
     request.session["instructor_id"] = 1
-    return RedirectResponse(url="/instructor", status_code=HTTP_303_SEE_OTHER)
-
-@app.post("/login/player")
-def login_player(request: Request, code: Optional[str] = Form(default=None), db: SASession = Depends(get_db)):
-    request.session.clear()
-    # if a code is provided, try to match; else pick first player
-    player = None
-    if code:
-        player = db.scalar(select(Player).where(Player.login_code == code))
-    if not player:
-        player = db.scalar(select(Player).order_by(Player.id.asc()))
-    if not player:
-        # create a sample player so dashboard works
-        player = Player(name="Sample Player", login_code="0000")
-        db.add(player)
-        db.commit()
-        db.refresh(player)
-    request.session["role"] = "player"
-    request.session["player_id"] = player.id
-    return RedirectResponse(url="/dashboard", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/instructor", status_code=303)
 
 @app.get("/logout")
 def logout(request: Request):
     request.session.clear()
-    return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
+    return RedirectResponse("/", status_code=303)
 
-# --------------------------------------------------------------------------------------
-# Instructor views
-# --------------------------------------------------------------------------------------
+@app.post("/login/player")
+def login_player(request: Request, code: str = Form(...)):
+    conn = get_db()
+    cur = conn.execute("SELECT id FROM players WHERE login_code = ?", (code.strip(),))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        # send back to home if invalid
+        return RedirectResponse("/", status_code=303)
+    request.session["player_id"] = int(row["id"])
+    return RedirectResponse("/dashboard", status_code=303)
 
+# -----------------------------------------------------------------------------
+# Instructor dashboard & player management
+# -----------------------------------------------------------------------------
 @app.get("/instructor", response_class=HTMLResponse)
-def instructor_home(request: Request, db: SASession = Depends(get_db)):
-    _require_instructor(request)
-    players = db.execute(select(Player).order_by(Player.favorited.desc(), Player.created_at.desc())).scalars().all()
-    # eager counts for templates that call p.metrics|length
-    # (SQLAlchemy lazy loads would also work, but let's be explicit)
+def instructor_home(request: Request):
+    try:
+        iid = require_instructor(request)
+    except RedirectResponse as r:
+        return r
+
+    conn = get_db()
+    cur = conn.execute("SELECT id, name, login_code, image_path FROM players ORDER BY name COLLATE NOCASE")
+    players = cur.fetchall()
+
+    # For each player, compute "sessions" = distinct metric days, and favorite flag
+    arr: List[Tuple[sqlite3.Row, int, bool]] = []
     for p in players:
-        _ = len(p.metrics)  # triggers load
-    return templates.TemplateResponse("instructor_dashboard.html", {"request": request, "players": players})
+        pc = conn.execute(
+            "SELECT COUNT(DISTINCT date(recorded_at)) AS c FROM metrics WHERE player_id = ?",
+            (p["id"],),
+        ).fetchone()["c"]
+        fav = conn.execute(
+            "SELECT 1 FROM favorites WHERE instructor_id = ? AND player_id = ?",
+            (iid, p["id"]),
+        ).fetchone()
+        arr.append((p, int(pc or 0), bool(fav)))
+
+    conn.close()
+
+    ctx = {"request": request, "arr": arr}
+    return templates.TemplateResponse("instructor_dashboard.html", ctx)
 
 @app.post("/players/create")
-def create_player(request: Request, name: str = Form(...), db: SASession = Depends(get_db)):
-    _require_instructor(request)
-    code = secrets.token_hex(2)  # short-ish login code
-    player = Player(name=name.strip(), login_code=code)
-    db.add(player)
-    db.commit()
-    return RedirectResponse(url="/instructor", status_code=HTTP_303_SEE_OTHER)
+def create_player(
+    request: Request,
+    name: str = Form(...),
+    login_code: Optional[str] = Form(None),
+):
+    try:
+        require_instructor(request)
+    except RedirectResponse as r:
+        return r
+
+    code = (login_code or "").strip() or ensure_login_code(name)
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO players (name, login_code) VALUES (?, ?)",
+        (name.strip(), code),
+    )
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/instructor", status_code=303)
 
 @app.post("/favorite/{player_id}")
-def toggle_favorite(request: Request, player_id: int, db: SASession = Depends(get_db)):
-    _require_instructor(request)
-    p = db.get(Player, player_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Player not found")
-    p.favorited = not bool(p.favorited)
-    db.commit()
-    return {"favorited": bool(p.favorited)}
+def toggle_favorite(request: Request, player_id: int):
+    try:
+        iid = require_instructor(request)
+    except RedirectResponse as r:
+        return r
 
+    conn = get_db()
+    cur = conn.execute(
+        "SELECT 1 FROM favorites WHERE instructor_id = ? AND player_id = ?",
+        (iid, player_id),
+    )
+    if cur.fetchone():
+        conn.execute("DELETE FROM favorites WHERE instructor_id = ? AND player_id = ?", (iid, player_id))
+        conn.commit()
+        conn.close()
+        return JSONResponse({"favorited": False})
+    else:
+        conn.execute(
+            "INSERT OR IGNORE INTO favorites (instructor_id, player_id) VALUES (?, ?)",
+            (iid, player_id),
+        )
+        conn.commit()
+        conn.close()
+        return JSONResponse({"favorited": True})
+
+# -----------------------------------------------------------------------------
+# Instructor: player detail, metrics, notes, drills
+# -----------------------------------------------------------------------------
 @app.get("/instructor/player/{player_id}", response_class=HTMLResponse)
-def instructor_player_detail(request: Request, player_id: int, db: SASession = Depends(get_db)):
-    _require_instructor(request)
-    player = db.get(Player, player_id)
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found")
+def instructor_player_detail(request: Request, player_id: int):
+    try:
+        iid = require_instructor(request)
+    except RedirectResponse as r:
+        return r
 
-    metrics = db.execute(
-        select(Metric)
-        .where(Metric.player_id == player_id)
-        .order_by(Metric.recorded_at.desc())
-        .limit(50)
-    ).scalars().all()
+    conn = get_db()
+    p = conn.execute("SELECT id, name, login_code, image_path FROM players WHERE id = ?", (player_id,)).fetchone()
+    if not p:
+        conn.close()
+        return PlainTextResponse("Player not found", status_code=404)
 
-    notes = db.execute(
-        select(Note)
-        .where(Note.player_id == player_id)
-        .order_by(Note.created_at.desc())
-        .limit(50)
-    ).scalars().all()
+    # recent tall metrics -> pivot for display list
+    mrows = conn.execute(
+        """
+        SELECT id, player_id, metric, value, unit, recorded_at, source, entered_by_instructor_id, note
+        FROM metrics
+        WHERE player_id = ?
+        ORDER BY recorded_at DESC
+        LIMIT 250
+        """,
+        (player_id,),
+    ).fetchall()
+    pivoted = pivot_metrics(list(reversed(mrows)))  # chronological for display
+    # show newest first in the list
+    pivoted.sort(key=lambda x: x["date"], reverse=True)
 
-    drills = db.execute(select(Drill).order_by(Drill.title.asc())).scalars().all()
+    notes = conn.execute(
+        """
+        SELECT id, player_id, instructor_id, text, shared, kind, created_at, updated_at
+        FROM notes
+        WHERE player_id = ?
+        ORDER BY created_at DESC
+        LIMIT 50
+        """,
+    (player_id,)).fetchall()
+
+    drills = conn.execute("SELECT id, title FROM drills ORDER BY title COLLATE NOCASE").fetchall()
+    conn.close()
 
     ctx = {
         "request": request,
-        "player": player,
-        "metrics": metrics,
+        "player": p,
+        "metrics": pivoted,   # list[{date, exit_velocity, launch_angle, spin_rate}]
         "notes": notes,
         "drills": drills,
     }
@@ -370,129 +426,167 @@ def instructor_player_detail(request: Request, player_id: int, db: SASession = D
 def add_metrics(
     request: Request,
     player_id: int = Form(...),
-    date_str: Optional[str] = Form(default=None, alias="date"),
-    exit_velocity: Optional[float] = Form(default=None),
-    launch_angle: Optional[float] = Form(default=None),
-    spin_rate: Optional[float] = Form(default=None),
-    db: SASession = Depends(get_db),
+    date: Optional[str] = Form(None),
+    exit_velocity: Optional[float] = Form(None),
+    launch_angle: Optional[float] = Form(None),
+    spin_rate: Optional[float] = Form(None),
 ):
-    _require_instructor(request)
-    player = db.get(Player, player_id)
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found")
+    try:
+        iid = require_instructor(request)
+    except RedirectResponse as r:
+        return r
 
-    recorded_at = None
-    if date_str:
-        try:
-            recorded_at = datetime.fromisoformat(date_str)
-        except Exception:
-            recorded_at = datetime.utcnow()
+    when = date or now_iso()
+    # normalize to ISO timestamp if user supplied YYYY-MM-DD
+    try:
+        if date and len(date) == 10:
+            when = datetime.fromisoformat(date).isoformat()
+    except Exception:
+        when = now_iso()
 
-    m = Metric(
-        player_id=player_id,
-        recorded_at=recorded_at or datetime.utcnow(),
-        exit_velocity=exit_velocity,
-        launch_angle=launch_angle,
-        spin_rate=spin_rate,
-    )
-    db.add(m)
-    db.commit()
-    return RedirectResponse(url=f"/instructor/player/{player_id}", status_code=HTTP_303_SEE_OTHER)
+    conn = get_db()
+    ins = []
+    if exit_velocity is not None:
+        ins.append(("exit_velocity", exit_velocity, "mph"))
+    if launch_angle is not None:
+        ins.append(("launch_angle", launch_angle, "deg"))
+    if spin_rate is not None:
+        ins.append(("spin_rate", spin_rate, "rpm"))
+
+    for m, v, unit in ins:
+        conn.execute(
+            """
+            INSERT INTO metrics (player_id, metric, value, unit, recorded_at, source, entered_by_instructor_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (player_id, m, v, unit, when, "manual", iid),
+        )
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/instructor/player/{player_id}", status_code=303)
 
 @app.post("/notes/add")
 def add_note(
     request: Request,
     player_id: int = Form(...),
-    text_value: str = Form(..., alias="text"),
-    share_with_player: Optional[str] = Form(default=None),
-    text_player: Optional[str] = Form(default=None),  # flag available if you later text via Twilio
-    db: SASession = Depends(get_db),
+    text: str = Form(...),
+    share_with_player: Optional[str] = Form(None),
+    text_player: Optional[str] = Form(None),
 ):
-    _require_instructor(request)
-    player = db.get(Player, player_id)
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found")
+    try:
+        iid = require_instructor(request)
+    except RedirectResponse as r:
+        return r
 
-    n = Note(
-        player_id=player_id,
-        instructor_id=request.session.get("instructor_id"),
-        text=text_value.strip(),
-        shared=bool(share_with_player),
-        kind="coach",
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+    shared = 1 if share_with_player else 0
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO notes (player_id, instructor_id, text, shared, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (player_id, iid, text.strip(), shared, now_iso(), now_iso()),
     )
-    db.add(n)
-    db.commit()
+    conn.commit()
+    conn.close()
 
-    # If you later want to text the player, hook Twilio here when text_player is set.
-
-    return RedirectResponse(url=f"/instructor/player/{player_id}", status_code=HTTP_303_SEE_OTHER)
+    # (Optional) texting could be implemented here if desired.
+    return RedirectResponse(f"/instructor/player/{player_id}", status_code=303)
 
 @app.post("/drills/assign")
 def assign_drill(
     request: Request,
     player_id: int = Form(...),
     drill_id: int = Form(...),
-    note: Optional[str] = Form(default=None),
-    db: SASession = Depends(get_db),
+    note: Optional[str] = Form(None),
 ):
-    _require_instructor(request)
-    player = db.get(Player, player_id)
-    drill = db.get(Drill, drill_id)
-    if not player or not drill:
-        raise HTTPException(status_code=404, detail="Player or Drill not found")
+    try:
+        iid = require_instructor(request)
+    except RedirectResponse as r:
+        return r
 
-    a = DrillAssignment(
-        player_id=player_id,
-        instructor_id=request.session.get("instructor_id"),
-        drill_id=drill_id,
-        note=note.strip() if note else None,
-        status="assigned",
-        created_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+    conn = get_db()
+    conn.execute(
+        """
+        INSERT INTO drill_assignments (player_id, instructor_id, drill_id, note, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'assigned', ?, ?)
+        """,
+        (player_id, iid, drill_id, (note or "").strip(), now_iso(), now_iso()),
     )
-    db.add(a)
-    db.commit()
-    return RedirectResponse(url=f"/instructor/player/{player_id}", status_code=HTTP_303_SEE_OTHER)
+    conn.commit()
+    conn.close()
+    return RedirectResponse(f"/instructor/player/{player_id}", status_code=303)
 
-# --------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Player dashboard
-# --------------------------------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request, db: SASession = Depends(get_db)):
-    _require_player(request)
-    player_id = request.session.get("player_id")
-    player = db.get(Player, player_id)
-    if not player:
-        raise HTTPException(status_code=404, detail="Player not found")
+def dashboard(request: Request):
+    try:
+        pid = require_player(request)
+    except RedirectResponse as r:
+        return r
 
-    # last shared note for player
-    last_note = db.execute(
-        select(Note)
-        .where(Note.player_id == player_id, Note.shared == True)  # noqa: E712
-        .order_by(Note.created_at.desc())
-        .limit(1)
-    ).scalars().first()
+    conn = get_db()
+    p = conn.execute("SELECT id, name, login_code, image_path FROM players WHERE id = ?", (pid,)).fetchone()
+    if not p:
+        conn.close()
+        return RedirectResponse("/", status_code=303)
 
-    # chart data: last 20 metrics by recorded_at asc (for time-series)
-    rows: List[Metric] = db.execute(
-        select(Metric)
-        .where(Metric.player_id == player_id)
-        .order_by(Metric.recorded_at.asc())
-        .limit(20)
-    ).scalars().all()
+    mrows = conn.execute(
+        """
+        SELECT metric, value, recorded_at
+        FROM metrics
+        WHERE player_id = ?
+        ORDER BY recorded_at ASC
+        """,
+        (pid,),
+    ).fetchall()
+    pivoted = pivot_metrics(mrows)
 
-    dates = [(_dateonly(m.recorded_at)) for m in rows]
-    exitv = [(m.exit_velocity or 0.0) for m in rows]
+    # Build chart arrays (always provide empty lists at minimum)
+    labels = [row["date"] for row in pivoted]
+    exitv = [row.get("exit_velocity") or 0 for row in pivoted]
 
-    # Always provide arrays so Jinja tojson doesn't see "Undefined"
+    # last shared note
+    last_note = conn.execute(
+        """
+        SELECT id, text, created_at
+        FROM notes
+        WHERE player_id = ? AND shared = 1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (pid,),
+    ).fetchone()
+
+    # recent assignments
+    assignments = conn.execute(
+        """
+        SELECT da.id, d.title, da.status, da.created_at, da.due_date
+        FROM drill_assignments da
+        JOIN drills d ON d.id = da.drill_id
+        WHERE da.player_id = ?
+        ORDER BY da.created_at DESC
+        LIMIT 20
+        """,
+        (pid,),
+    ).fetchall()
+
+    conn.close()
+
     ctx = {
         "request": request,
-        "player": player,
+        "player": p,
+        "labels": labels,
+        "data": exitv,        # for older template variants
+        "dates": labels,      # for newer template variants
+        "exitv": exitv,       # for newer template variants
         "last_note": last_note,
-        "dates": dates or [],
-        "exitv": exitv or [],
+        "assignments": assignments,
     }
     return templates.TemplateResponse("dashboard.html", ctx)
+
+# -----------------------------------------------------------------------------
+# Fallback for unknown HEAD probes (optional: uncomment if you still see HEAD 405s)
+# -----------------------------------------------------------------------------
+# @app.head("/{path:path}", include_in_schema=False)
+# def any_head(path: str):
+#    return Response(status_code=200)

@@ -60,18 +60,22 @@ def get_db():
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
+from sqlalchemy.exc import OperationalError, ProgrammingError
+
 def _login_lookup(db: Session, model, raw_code: str):
-    """
-    Flexible login lookup:
-      1) Try normalized plaintext match (if you store normalized codes)
-      2) Try hashed match (if you store HMAC of normalized)
-    """
     norm = normalize_code(raw_code)
-    obj = db.execute(select(model).where(model.login_code == norm)).scalar_one_or_none()
-    if obj:
+    try:
+        obj = db.execute(select(model).where(model.login_code == norm)).scalar_one_or_none()
+        if obj:
+            return obj
+        hashed = hash_code(raw_code)
+        obj = db.execute(select(model).where(model.login_code == hashed)).scalar_one_or_none()
         return obj
-    hashed = hash_code(raw_code)
-    return db.execute(select(model).where(model.login_code == hashed)).scalar_one_or_none()
+    except (OperationalError, ProgrammingError) as e:
+        # Likely: column doesn't exist yet in your DB schema.
+        # Log it and fall through to "invalid code" behavior.
+        print(f"[login_lookup] schema issue: {e}")  # or use logging
+        return None
 
 
 def _latest_metrics_query(player_id: int):
@@ -199,6 +203,7 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         set_flash(request, "Please log in as an instructor.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
+    # Last metric per player (timestamp)
     last_metric_subq = (
         select(
             Metric.player_id.label("pid"),
@@ -208,16 +213,18 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         .subquery()
     )
 
+    # Order by "last updated metric" DESC; then player id DESC as a stable tie-breaker
     rows = db.execute(
         select(Player, last_metric_subq.c.last_metric_at)
         .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
-        .order_by(func.coalesce(last_metric_subq.c.last_metric_at, Player.updated_at).desc())
+        .order_by(last_metric_subq.c.last_metric_at.desc().nulls_last(), Player.id.desc())
     ).all()
 
     players = [{"player": r[0], "last_update": r[1]} for r in rows]
 
     ctx = {"request": request, "flash": pop_flash(request), "players": players}
     return templates.TemplateResponse("instructor_dashboard.html", ctx)
+
 
 
 @app.get("/instructor/player/{player_id}")

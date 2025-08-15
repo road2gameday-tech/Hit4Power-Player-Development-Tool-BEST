@@ -1,82 +1,126 @@
 {% extends "base.html" %}
 {% set title = "My Dashboard" %}
-
 {% block content %}
 
-<!-- Player header (keep your existing header block) -->
-
-<!-- Exit Velocity Trend -->
-<div class="card">
-  <div class="card-title">Exit Velocity Trend</div>
-
-  {% if dates and dates|length > 0 %}
-    <div style="height:280px">
-      <canvas id="evChart"></canvas>
+  <!-- Player header with name, age, login code -->
+  <div class="card mb-2">
+    <div class="flex items-center gap-3">
+      <div class="avatar">
+        {% if player.avatar_url %}
+          <img src="{{ player.avatar_url }}" alt="{{ player.name }}"/>
+        {% else %}
+          <div class="avatar-placeholder">{{ (player.name or 'P')[:1] }}</div>
+        {% endif %}
+      </div>
+      <div class="flex-1">
+        <h2 class="player-name">{{ player.name or 'Player' }}</h2>
+        <div class="muted">
+          {% if age_years is not none %}Age: {{ age_years }} • {% endif %}
+          Login Code: {{ login_code }}
+        </div>
+      </div>
     </div>
-  {% else %}
-    <div class="muted">No exit velocity data yet.</div>
-  {% endif %}
-</div>
-
-<!-- Updated Metrics + Coach Notes / Assigned Drills row -->
-<div class="grid grid-2">
-  <div class="card">
-    <div class="card-title">Updated Metrics</div>
-    {% if latest_metrics and latest_metrics|length > 0 %}
-      <ul class="list">
-        {% for m in latest_metrics %}
-          <li>
-            <strong>{{ m.metric|replace('_',' ')|title }}</strong>:
-            {{ m.value }}{% if m.unit %} {{ m.unit }}{% endif %}
-            <span class="muted"> — {{ m.recorded_at|datetimeformat }}</span>
-          </li>
-        {% endfor %}
-      </ul>
-    {% else %}
-      <div class="muted">No metrics yet.</div>
-    {% endif %}
   </div>
 
-  <!-- Keep your existing Coach Notes / Assigned Drills cards.
-       If you’d rather keep the current two-card layout, you can put
-       “Updated Metrics” above them or as a third card. -->
-</div>
+  <div class="grid two">
+    <!-- Exit Velocity Trend -->
+    <section class="card">
+      <h3 class="section-title">Exit Velocity Trend</h3>
+      {% if dates and dates|length > 0 %}
+        <div style="height: 220px;">
+          <canvas id="evChart" height="200"></canvas>
+        </div>
+      {% else %}
+        <div class="muted">No exit velocity data yet.</div>
+      {% endif %}
+    </section>
 
-{% endblock %}
+    <!-- Updated Metrics (optional – keep empty for now or list latest numbers if you add them later) -->
+    <section class="card">
+      <h3 class="section-title">Updated Metrics</h3>
+      <div class="muted">No metrics yet.</div>
+    </section>
+  </div>
 
-{% block scripts %}
-  {{ super() }}
+  <div class="grid two mt-2">
+    <!-- Player-visible notes -->
+    <section class="card">
+      <h3 class="section-title">Coach Notes</h3>
+      <ul class="list mt-1">
+        {% for n in notes or [] %}
+          <li>
+            <div class="note-text">{{ n.text }}</div>
+            <div class="note-meta">
+              {{ n.created_at|datetimeformat("%Y-%m-%d %H:%M") }}
+              {% if n.kind %} • {{ n.kind|title }}{% endif %}
+            </div>
+          </li>
+        {% else %}
+          <li class="muted">No notes yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
 
-  {% if dates and dates|length > 0 %}
+    <!-- Assigned Drills -->
+    <section class="card">
+      <h3 class="section-title">Assigned Drills</h3>
+      <ul class="list mt-1">
+        {% for a in assignments or [] %}
+          <li>
+            <div><strong>{{ a.drill_name }}</strong> — {{ a.status or 'assigned' }}</div>
+            {% if a.note %}<div class="muted">“{{ a.note }}”</div>{% endif %}
+            <div class="muted">
+              Assigned: {{ a.created_at|datetimeformat("%Y-%m-%d") }}
+              {% if a.due_date %} • Due: {{ a.due_date|datetimeformat("%Y-%m-%d") }}{% endif %}
+            </div>
+          </li>
+        {% else %}
+          <li class="muted">No assigned drills yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
+  </div>
+
+  <!-- Chart.js (defensive against undefined data) -->
   <script>
-  (function () {
-    const labels = {{ dates|tojson }};
-    const dataEV = {{ exitv|tojson }};
+    (function () {
+      const labels = {{ (dates or [])|tojson }};
+      const data = {{ (exitv or [])|tojson }};
+      if (!Array.isArray(labels) || labels.length === 0) return;
 
-    const canvas = document.getElementById('evChart');
-    if (!canvas) return;
-    if (typeof Chart === 'undefined') { console.warn('Chart.js not loaded'); return; }
+      const ensureChartJs = () => new Promise((resolve) => {
+        if (window.Chart) return resolve();
+        const s = document.createElement('script');
+        s.src = "https://cdn.jsdelivr.net/npm/chart.js";
+        s.onload = resolve;
+        document.head.appendChild(s);
+      });
 
-    // Create the chart
-    new Chart(canvas.getContext('2d'), {
-      type: 'line',
-      data: {
-        labels: labels,
-        datasets: [{
-          label: 'Exit Velocity',
-          data: dataEV,
-          borderWidth: 2,
-          tension: 0.3,
-          fill: false
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: { y: { beginAtZero: true } }
-      }
-    });
-  })();
+      ensureChartJs().then(() => {
+        const el = document.getElementById('evChart');
+        if (!el) return;
+        new Chart(el, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [{
+              label: 'Exit Velocity (mph)',
+              data: data,
+              fill: false,
+              tension: 0.25
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { autoSkip: true, maxTicksLimit: 6 } },
+              y: { beginAtZero: true }
+            },
+            plugins: { legend: { display: true } }
+          }
+        });
+      });
+    })();
   </script>
-  {% endif %}
 {% endblock %}

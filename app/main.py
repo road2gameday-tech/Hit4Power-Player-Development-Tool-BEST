@@ -578,14 +578,13 @@ def assign_drill(
 # -----------------------------------------------------------------------------
 # Player dashboard
 # -----------------------------------------------------------------------------
-# --- imports (keep near your other imports) ---
+# at top with other imports
+import sqlite3
 from datetime import date, datetime
 
-# helper to compute age safely
 def _years_old(dob_str: str | None) -> int | None:
     if not dob_str:
         return None
-    # accept YYYY-MM-DD or mm/dd/yyyy
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
             d = datetime.strptime(dob_str, fmt).date()
@@ -597,88 +596,79 @@ def _years_old(dob_str: str | None) -> int | None:
 
 @app.get("/dashboard")
 def dashboard(request: Request):
-    # must be logged-in as a player
-    player_id = request.session.get("player_id")
-    if not player_id:
+    pid = request.session.get("player_id")
+    if not pid:
         return RedirectResponse("/", status_code=303)
 
     conn = get_db()
     try:
-        # pull common fields + optional dob variants (schema-safe)
-        player = conn.execute(
-            """
-            SELECT id, name, login_code,
-                   COALESCE(avatar_url, image_path) AS avatar_url,
-                   -- try multiple possible DOB column names; whichever exists will be non-null
-                   CASE
-                     WHEN 1 THEN (SELECT value FROM pragma_table_info('players') WHERE name='birthdate')
-                   END AS _,
-                   birthdate, dob, date_of_birth
-            FROM players
-            WHERE id = ?
-            """,
-            (player_id,),
-        ).fetchone()
-
-        if not player:
+        # Pull everything, then compute fallbacks in Python to avoid missing-column errors
+        row = conn.execute("SELECT * FROM players WHERE id = ?", (pid,)).fetchone()
+        if not row:
             return RedirectResponse("/", status_code=303)
 
-        # find a DOB string among possible columns
-        dob_str = None
-        for k in ("birthdate", "dob", "date_of_birth"):
-            if k in player.keys():
-                dob_str = player[k] or dob_str
+        player = dict(row)
+        player["avatar_url"] = player.get("avatar_url") or player.get("image_path") or None
+        login_code = player.get("login_code") or ""
 
+        # Age from whichever DOB column exists
+        dob_str = player.get("birthdate") or player.get("dob") or player.get("date_of_birth")
         age_years = _years_old(dob_str)
 
-        # Chart data (exit velocity over time)
-        rows = conn.execute(
+        # Chart data (safe)
+        mrows = conn.execute(
             """
-            SELECT
-              COALESCE(date, recorded_at, substr(created_at,1,10)) AS d,
-              exit_velocity
+            SELECT COALESCE(date, recorded_at, substr(created_at,1,10)) AS d,
+                   exit_velocity
             FROM metrics
             WHERE player_id = ? AND exit_velocity IS NOT NULL
             ORDER BY COALESCE(date, recorded_at, created_at) ASC, id ASC
             LIMIT 90
             """,
-            (player_id,),
+            (pid,),
         ).fetchall()
+        dates = [r["d"] for r in mrows] if mrows else []
+        exitv  = [float(r["exit_velocity"]) for r in mrows] if mrows else []
 
-        dates = [r["d"] for r in rows] if rows else []
-        exitv = [float(r["exit_velocity"]) for r in rows] if rows else []
-
-        # Notes visible to the player (shared only)
-        notes = conn.execute(
+        # Notes: select all, then filter in Python for shared flags (handles schemas w/ or w/o share_with_player)
+        nrows = conn.execute(
             """
-            SELECT text, created_at, kind
-            FROM notes
-            WHERE player_id = ? AND (shared = 1 OR share_with_player = 1)
+            SELECT * FROM notes
+            WHERE player_id = ?
             ORDER BY created_at DESC, id DESC
-            LIMIT 25
+            LIMIT 100
             """,
-            (player_id,),
+            (pid,),
         ).fetchall()
+        notes = []
+        for r in nrows or []:
+            d = dict(r)
+            if bool(d.get("shared")) or bool(d.get("share_with_player")):
+                notes.append(d)
 
-        # Assigned drills
-        assignments = conn.execute(
-            """
-            SELECT a.created_at, a.due_date, a.status, a.note,
-                   COALESCE(d.title, d.name, 'Drill') AS drill_name
-            FROM assignments a
-            LEFT JOIN drills d ON d.id = a.drill_id
-            WHERE a.player_id = ?
-            ORDER BY a.created_at DESC, a.id DESC
-            LIMIT 25
-            """,
-            (player_id,),
-        ).fetchall()
+        # Assignments: try join, but tolerate missing tables/columns
+        try:
+            arows = conn.execute(
+                """
+                SELECT a.*,
+                       COALESCE(d.title, d.name, 'Drill') AS drill_name
+                FROM assignments a
+                LEFT JOIN drills d ON d.id = a.drill_id
+                WHERE a.player_id = ?
+                ORDER BY a.created_at DESC, a.id DESC
+                LIMIT 25
+                """,
+                (pid,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            arows = []
+        assignments = [dict(r) for r in (arows or [])]
 
         ctx = {
             "request": request,
-            "player": player,
+            "player": player,          # dict works with dot-access in Jinja
             "age_years": age_years,
-            "login_code": player["login_code"],
+            "login_code": login_code,
             "dates": dates,
             "exitv": exitv,
             "notes": notes,
@@ -687,4 +677,3 @@ def dashboard(request: Request):
         return templates.TemplateResponse("dashboard.html", ctx)
     finally:
         conn.close()
-

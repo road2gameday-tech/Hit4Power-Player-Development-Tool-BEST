@@ -137,7 +137,26 @@ def login_player(request: Request, code: str = Form(...), db: Session = Depends(
 
 @app.post("/login/instructor")
 def login_instructor(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
+    # 1) Try DB-based login first
     coach = _login_lookup(db, Instructor, code)
+
+    # 2) If not found, honor INSTRUCTOR_DEFAULT_CODE as a fallback
+    if not coach:
+        env_code = os.getenv("INSTRUCTOR_DEFAULT_CODE", "")
+        if env_code and normalize_code(code) == normalize_code(env_code):
+            # Find-or-create a default instructor bound to this env code
+            coach = db.execute(select(Instructor).order_by(Instructor.id.asc())).scalar_one_or_none()
+            if not coach:
+                # Store the normalized code (or hash_code(env_code) if you prefer hashing)
+                coach = Instructor(name="Default Instructor", login_code=normalize_code(env_code))
+                db.add(coach)
+                db.commit()
+            else:
+                # Ensure login_code is set so future DB lookups succeed
+                if not coach.login_code:
+                    coach.login_code = normalize_code(env_code)
+                    db.commit()
+
     if not coach:
         set_flash(request, "Invalid code. Please try again.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
@@ -145,6 +164,7 @@ def login_instructor(request: Request, code: str = Form(...), db: Session = Depe
     request.session["instructor_id"] = coach.id
     request.session.pop("player_id", None)
     return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
+
 
 
 @app.get("/logout")

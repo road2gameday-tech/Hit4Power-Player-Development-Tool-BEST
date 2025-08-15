@@ -11,6 +11,52 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.templating import Jinja2Templates
 
+# --- imports (top of file, with your other FastAPI imports) ---
+from fastapi import Form, HTTPException
+from starlette.responses import RedirectResponse
+import random, string
+
+# --- helper: make a unique 6-digit login code ---
+def _make_login_code(conn, length: int = 6) -> str:
+    for _ in range(50):
+        code = "".join(random.choices(string.digits, k=length))
+        exists = conn.execute(
+            "SELECT 1 FROM players WHERE login_code = ?", (code,)
+        ).fetchone()
+        if not exists:
+            return code
+    raise RuntimeError("Could not generate unique login code")
+
+# --- route: create a player (form posts here) ---
+@app.post("/players/create")
+def create_player(request: Request, name: str = Form(...)):
+    # must be an instructor
+    try:
+        instructor_id = require_instructor(request)
+    except RedirectResponse as r:
+        return r
+
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required")
+
+    conn = get_db()
+    try:
+        login_code = _make_login_code(conn)
+        conn.execute(
+            """
+            INSERT INTO players (name, login_code, created_at, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (name, login_code),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # back to the instructor dashboard
+    return RedirectResponse(url="/instructor", status_code=303)
+
 # -----------------------------------------------------------------------------
 # App & Templating
 # -----------------------------------------------------------------------------

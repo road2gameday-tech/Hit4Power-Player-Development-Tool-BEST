@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% set title = "Drill Library" %}
+{% block content %}
+  <a href="{{ player_id and ('/instructor/player/' ~ player_id) or '/instructor' }}" class="btn btn-ghost mb-1">← Back</a>
+
+  <div class="card">
+    <form method="get" action="/drills" class="form flex-row">
+      {% if player_id %}<input type="hidden" name="player_id" value="{{ player_id }}"/>{% endif %}
+      <input name="q" value="{{ q }}" placeholder="Search drills…" />
+      <button class="btn">Search</button>
+    </form>
+  </div>
+
+  <div class="list mt-1">
+    {% for d in drills %}
+      <div class="card">
+        <div class="flex-row items-center justify-between">
+          <div>
+            <div class="font-bold">{{ d.title }}</div>
+            {% if d.description %}<div class="muted">{{ d.description }}</div>{% endif %}
+          </div>
+          {% if player_id %}
+            <form method="post" action="/drills/assign" class="form flex-row">
+              <input type="hidden" name="player_id" value="{{ player_id }}"/>
+              <input type="hidden" name="drill_id" value="{{ d.id }}"/>
+              <input name="note" placeholder="Optional note" />
+              <button class="btn btn-red">Assign to Player</button>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+    {% else %}
+      <div class="card muted">No drills found.</div>
+    {% endfor %}
+  </div>
+{% endblock %}

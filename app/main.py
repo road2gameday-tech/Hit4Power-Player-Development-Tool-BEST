@@ -293,6 +293,9 @@ def login_player(request: Request, code: str = Form(...)):
 # -----------------------------------------------------------------------------
 # Instructor dashboard & player management
 # -----------------------------------------------------------------------------
+from collections import OrderedDict
+import string
+
 @app.get("/instructor", response_class=HTMLResponse)
 def instructor_home(request: Request):
     try:
@@ -304,70 +307,62 @@ def instructor_home(request: Request):
     cur = conn.execute("SELECT id, name, login_code, image_path FROM players ORDER BY name COLLATE NOCASE")
     players = cur.fetchall()
 
-    # For each player, compute "sessions" = distinct metric days, and favorite flag
-    arr: List[Tuple[sqlite3.Row, int, bool]] = []
+    # Build (player_row, sessions_count, is_favorited) triples
+    arr = []
     for p in players:
-        pc = conn.execute(
+        sessions_count = conn.execute(
             "SELECT COUNT(DISTINCT date(recorded_at)) AS c FROM metrics WHERE player_id = ?",
             (p["id"],),
         ).fetchone()["c"]
-        fav = conn.execute(
+        is_fav = conn.execute(
             "SELECT 1 FROM favorites WHERE instructor_id = ? AND player_id = ?",
             (iid, p["id"]),
-        ).fetchone()
-        arr.append((p, int(pc or 0), bool(fav)))
+        ).fetchone() is not None
+        arr.append((p, int(sessions_count or 0), is_fav))
+
+    # ---- Group into ⭐ Favorites, A–Z, and # (non-alpha) ----
+    favorites: list = []
+    letter_buckets: dict = {}
+    for triple in arr:
+        p = triple[0]
+        name = (p["name"] or "").strip()
+        if triple[2]:
+            favorites.append(triple)
+
+        # pick first alphabetic character; else '#'
+        first_alpha = "#"
+        for ch in name:
+            if ch.isalpha():
+                first_alpha = ch.upper()
+                break
+        if first_alpha not in string.ascii_uppercase:
+            first_alpha = "#"
+
+        letter_buckets.setdefault(first_alpha, []).append(triple)
+
+    # sort each bucket by player name
+    for k in letter_buckets:
+        letter_buckets[k].sort(key=lambda t: (t[0]["name"] or "").lower())
+    favorites.sort(key=lambda t: (t[0]["name"] or "").lower())
+
+    # Ordered dict with Favorites first, then A–Z, then '#'
+    grouped = OrderedDict()
+    if favorites:
+        grouped["★ Favorites"] = favorites
+    for L in string.ascii_uppercase:
+        if L in letter_buckets:
+            grouped[L] = letter_buckets[L]
+    if "#" in letter_buckets:
+        grouped["#"] = letter_buckets["#"]
 
     conn.close()
 
-    ctx = {"request": request, "arr": arr}
+    ctx = {
+        "request": request,
+        "arr": arr,          # keeps older templates happy
+        "grouped": grouped,  # new template expects this
+    }
     return templates.TemplateResponse("instructor_dashboard.html", ctx)
-
-@app.post("/players/create")
-def create_player(
-    request: Request,
-    name: str = Form(...),
-    login_code: Optional[str] = Form(None),
-):
-    try:
-        require_instructor(request)
-    except RedirectResponse as r:
-        return r
-
-    code = (login_code or "").strip() or ensure_login_code(name)
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO players (name, login_code) VALUES (?, ?)",
-        (name.strip(), code),
-    )
-    conn.commit()
-    conn.close()
-    return RedirectResponse("/instructor", status_code=303)
-
-@app.post("/favorite/{player_id}")
-def toggle_favorite(request: Request, player_id: int):
-    try:
-        iid = require_instructor(request)
-    except RedirectResponse as r:
-        return r
-
-    conn = get_db()
-    cur = conn.execute(
-        "SELECT 1 FROM favorites WHERE instructor_id = ? AND player_id = ?",
-        (iid, player_id),
-    )
-    if cur.fetchone():
-        conn.execute("DELETE FROM favorites WHERE instructor_id = ? AND player_id = ?", (iid, player_id))
-        conn.commit()
-        conn.close()
-        return JSONResponse({"favorited": False})
-    else:
-        conn.execute(
-            "INSERT OR IGNORE INTO favorites (instructor_id, player_id) VALUES (?, ?)",
-            (iid, player_id),
-        )
-        conn.commit()
-        conn.close()
-        return JSONResponse({"favorited": True})
 
 # -----------------------------------------------------------------------------
 # Instructor: player detail, metrics, notes, drills

@@ -578,48 +578,113 @@ def assign_drill(
 # -----------------------------------------------------------------------------
 # Player dashboard
 # -----------------------------------------------------------------------------
+# --- imports (keep near your other imports) ---
+from datetime import date, datetime
+
+# helper to compute age safely
+def _years_old(dob_str: str | None) -> int | None:
+    if not dob_str:
+        return None
+    # accept YYYY-MM-DD or mm/dd/yyyy
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            d = datetime.strptime(dob_str, fmt).date()
+            today = date.today()
+            return today.year - d.year - ((today.month, today.day) < (d.month, d.day))
+        except ValueError:
+            continue
+    return None
+
 @app.get("/dashboard")
 def dashboard(request: Request):
-    try:
-        pid = _require_player(request)
-    except HTTPException:
+    # must be logged-in as a player
+    player_id = request.session.get("player_id")
+    if not player_id:
         return RedirectResponse("/", status_code=303)
 
     conn = get_db()
     try:
-        player = conn.execute("SELECT * FROM players WHERE id = ?", (pid,)).fetchone()
-        if not player:
-            request.session.pop("player_id", None)
-            return RedirectResponse("/", status_code=303)
-
-        last_note = conn.execute(
+        # pull common fields + optional dob variants (schema-safe)
+        player = conn.execute(
             """
-            SELECT text, created_at
-            FROM notes
-            WHERE player_id = ? AND shared = 1
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
+            SELECT id, name, login_code,
+                   COALESCE(avatar_url, image_path) AS avatar_url,
+                   -- try multiple possible DOB column names; whichever exists will be non-null
+                   CASE
+                     WHEN 1 THEN (SELECT value FROM pragma_table_info('players') WHERE name='birthdate')
+                   END AS _,
+                   birthdate, dob, date_of_birth
+            FROM players
+            WHERE id = ?
             """,
-            (pid,),
+            (player_id,),
         ).fetchone()
 
-        metric_rows = conn.execute(
+        if not player:
+            return RedirectResponse("/", status_code=303)
+
+        # find a DOB string among possible columns
+        dob_str = None
+        for k in ("birthdate", "dob", "date_of_birth"):
+            if k in player.keys():
+                dob_str = player[k] or dob_str
+
+        age_years = _years_old(dob_str)
+
+        # Chart data (exit velocity over time)
+        rows = conn.execute(
             """
-            SELECT COALESCE(date, recorded_at, substr(created_at, 1, 10)) AS date,
-                   exit_velocity
+            SELECT
+              COALESCE(date, recorded_at, substr(created_at,1,10)) AS d,
+              exit_velocity
             FROM metrics
-            WHERE player_id = ?
-              AND exit_velocity IS NOT NULL
+            WHERE player_id = ? AND exit_velocity IS NOT NULL
             ORDER BY COALESCE(date, recorded_at, created_at) ASC, id ASC
-            LIMIT 12
+            LIMIT 90
             """,
-            (pid,),
+            (player_id,),
         ).fetchall()
 
-        dates = [r["date"] for r in metric_rows] if metric_rows else []
-        exitv = [r["exit_velocity"] for r in metric_rows] if metric_rows else []
+        dates = [r["d"] for r in rows] if rows else []
+        exitv = [float(r["exit_velocity"]) for r in rows] if rows else []
 
-        ctx = {"request": request, "player": player, "last_note": last_note, "dates": dates, "exitv": exitv}
+        # Notes visible to the player (shared only)
+        notes = conn.execute(
+            """
+            SELECT text, created_at, kind
+            FROM notes
+            WHERE player_id = ? AND (shared = 1 OR share_with_player = 1)
+            ORDER BY created_at DESC, id DESC
+            LIMIT 25
+            """,
+            (player_id,),
+        ).fetchall()
+
+        # Assigned drills
+        assignments = conn.execute(
+            """
+            SELECT a.created_at, a.due_date, a.status, a.note,
+                   COALESCE(d.title, d.name, 'Drill') AS drill_name
+            FROM assignments a
+            LEFT JOIN drills d ON d.id = a.drill_id
+            WHERE a.player_id = ?
+            ORDER BY a.created_at DESC, a.id DESC
+            LIMIT 25
+            """,
+            (player_id,),
+        ).fetchall()
+
+        ctx = {
+            "request": request,
+            "player": player,
+            "age_years": age_years,
+            "login_code": player["login_code"],
+            "dates": dates,
+            "exitv": exitv,
+            "notes": notes,
+            "assignments": assignments,
+        }
         return templates.TemplateResponse("dashboard.html", ctx)
     finally:
         conn.close()
+

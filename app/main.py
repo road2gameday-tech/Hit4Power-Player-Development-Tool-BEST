@@ -18,15 +18,13 @@ from .database import SessionLocal, engine, Base
 from .models import Player, Instructor, Metric, Note, DrillAssignment
 from .utils import normalize_code, hash_code, set_flash, pop_flash, age_bucket
 
-
 # ------------------------------------------------------------------------------
 # App setup
 # ------------------------------------------------------------------------------
 app = FastAPI()
 
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-insecure-session-secret")
-# Set ENV=prod on Render to make cookies secure
-HTTPS_ONLY = os.getenv("ENV", "dev") != "dev"
+HTTPS_ONLY = os.getenv("ENV", "dev") != "dev"  # set ENV=prod on Render for secure cookies
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
@@ -41,7 +39,6 @@ templates = Jinja2Templates(directory="app/templates")
 
 # Create missing TABLES (not columns)
 Base.metadata.create_all(bind=engine)
-
 
 # ------------------------------------------------------------------------------
 # Schema helpers / patching
@@ -93,11 +90,25 @@ def _ensure_schema():
     if "updated_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN updated_at TEXT")
 
-    # Metrics — add and backfill recorded_at (prevents MAX(recorded_at) errors)
-    if "recorded_at" not in metric_cols:
-        _add("metrics", "ALTER TABLE metrics ADD COLUMN recorded_at TEXT")
+    # Metrics — ensure the full set of columns your models/templates expect
+    expected_metrics_cols = [
+        ("metric", "TEXT"),
+        ("value", "REAL"),
+        ("unit", "TEXT"),
+        ("recorded_at", "TEXT"),
+        ("source", "TEXT"),
+        ("entered_by_instructor_id", "INTEGER"),
+        ("note", "TEXT"),
+    ]
+    for name, typ in expected_metrics_cols:
+        if name not in metric_cols:
+            _add("metrics", f"ALTER TABLE metrics ADD COLUMN {name} {typ}")
+
+    # Backfill recorded_at from created_at if present; else current time
+    metric_cols_after = cols("metrics")
+    if "recorded_at" in metric_cols_after:
         with engine.begin() as conn:
-            if "created_at" in metric_cols:
+            if "created_at" in metric_cols_after:
                 conn.execute(text(
                     "UPDATE metrics SET recorded_at = COALESCE(recorded_at, created_at, CURRENT_TIMESTAMP)"
                 ))
@@ -114,10 +125,8 @@ def _ensure_schema():
         conn.execute(text("UPDATE players SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE players SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
 
-
 # Run schema patch once at import time (service startup)
 _ensure_schema()
-
 
 # ------------------------------------------------------------------------------
 # DB dependency
@@ -128,7 +137,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
 
 # ------------------------------------------------------------------------------
 # Helpers
@@ -145,7 +153,6 @@ def _login_lookup(db: Session, model, raw_code: str):
     except (OperationalError, ProgrammingError) as e:
         print(f"[login_lookup] schema issue: {e}")
         return None
-
 
 def _latest_metrics_query(player_id: int):
     """
@@ -166,7 +173,7 @@ def _latest_metrics_query(player_id: int):
             .order_by(Metric.metric.asc())
         )
 
-    # Fallback when recorded_at doesn't exist yet
+    # Fallback when recorded_at doesn't exist (extremely unlikely after _ensure_schema)
     subq = (
         select(Metric.metric.label("metric"), func.max(Metric.id).label("latest_id"))
         .where(Metric.player_id == player_id)
@@ -180,7 +187,6 @@ def _latest_metrics_query(player_id: int):
         .order_by(Metric.metric.asc())
     )
 
-
 def _parse_iso_dt(value: Optional[str]) -> datetime:
     """Parse ISO8601 timestamps including 'Z' suffix; default to now if empty/invalid."""
     if not value:
@@ -193,30 +199,23 @@ def _parse_iso_dt(value: Optional[str]) -> datetime:
     except Exception:
         return datetime.utcnow()
 
-
 def _parse_dt_from_db(val: Optional[str]) -> Optional[datetime]:
-    """
-    Parse DB timestamp strings (SQLite 'YYYY-MM-DD HH:MM:SS' or ISO8601) into datetime.
-    Returns None if parsing fails.
-    """
+    """Parse DB timestamp-ish strings into datetime (lenient)."""
     if not val:
         return None
     if isinstance(val, datetime):
         return val
     s = str(val).strip()
     try:
-        # ISO 8601 (handles 'YYYY-MM-DDTHH:MM:SS[+00:00]')
         if s.endswith("Z"):
             s = s.replace("Z", "+00:00")
         return datetime.fromisoformat(s)
     except Exception:
         pass
-    # SQLite common format 'YYYY-MM-DD HH:MM:SS'
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
-
 
 def _bucket_by_recency(dt: Optional[datetime]) -> str:
     if not dt:
@@ -231,7 +230,6 @@ def _bucket_by_recency(dt: Optional[datetime]) -> str:
         return "Updated this month"
     return "Stale (30+ days)"
 
-
 def _session_counts_by_player(db: Session) -> Dict[int, int]:
     """
     Compute number of distinct metric days per player (i.e., 'sessions').
@@ -239,10 +237,7 @@ def _session_counts_by_player(db: Session) -> Dict[int, int]:
     """
     counts: Dict[int, int] = {}
     if not _has_column("metrics", "recorded_at"):
-        # Extremely defensive: if somehow absent, just count rows.
-        rows = db.execute(
-            select(Metric.player_id, func.count(Metric.id)).group_by(Metric.player_id)
-        ).all()
+        rows = db.execute(select(Metric.player_id, func.count(Metric.id)).group_by(Metric.player_id)).all()
         for pid, c in rows:
             counts[int(pid)] = int(c)
         return counts
@@ -257,16 +252,27 @@ def _session_counts_by_player(db: Session) -> Dict[int, int]:
         counts[int(pid)] = int(c)
     return counts
 
+def _player_to_dict(p: Player) -> Dict[str, Optional[str]]:
+    """Convert ORM Player to a dict so Jinja dot access avoids ORM lazy-loads."""
+    return {
+        "id": p.id,
+        "name": p.name,
+        "age": p.age,
+        "login_code": getattr(p, "login_code", None),
+        "phone": getattr(p, "phone", None),
+        "image_path": getattr(p, "image_path", None),
+        "created_at": getattr(p, "created_at", None),
+        "updated_at": getattr(p, "updated_at", None),
+    }
 
-def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dict[int, int]) -> Dict[str, List[Tuple[Player, int, bool]]]:
+def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dict[int, int]) -> Dict[str, List[Tuple[dict, int, bool]]]:
     """
     rows: sequence of (Player, last_metric_at)
-    returns: dict bucket -> list of (player, sessions_int, is_fav_bool)
+    returns: dict bucket -> list of (player_dict_with_fake_metrics, sessions_int, is_fav_bool)
     """
-    grouped: Dict[str, List[Tuple[Player, int, bool]]] = {}
+    grouped: Dict[str, List[Tuple[dict, int, bool]]] = {}
+    parsed: List[Tuple[Player, Optional[datetime]]] = []
 
-    # Pre-parse and sort by last_update desc then id desc, so groups keep nice order
-    parsed = []
     for p, last_raw in rows:
         last_dt = _parse_dt_from_db(last_raw)
         parsed.append((p, last_dt))
@@ -275,11 +281,13 @@ def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dic
     for p, last_dt in parsed:
         bucket = _bucket_by_recency(last_dt)
         sessions = session_counts.get(p.id, 0)
-        is_fav = False  # No 'favorite' flag in schema; template expects a third value.
-        grouped.setdefault(bucket, []).append((p, sessions, is_fav))
+        is_fav = False  # no favorites field in schema
+        pdict = _player_to_dict(p)
+        # IMPORTANT: provide a synthetic "metrics" list so template can call p.metrics|length
+        pdict["metrics"] = [None] * sessions
+        grouped.setdefault(bucket, []).append((pdict, sessions, is_fav))
 
     return grouped
-
 
 # ------------------------------------------------------------------------------
 # Routes
@@ -288,7 +296,6 @@ def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dic
 def index(request: Request):
     ctx = {"request": request, "flash": pop_flash(request)}
     return templates.TemplateResponse("index.html", ctx)
-
 
 @app.post("/login/player")
 def login_player(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
@@ -300,13 +307,12 @@ def login_player(request: Request, code: str = Form(...), db: Session = Depends(
     request.session.pop("instructor_id", None)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
-
 @app.post("/login/instructor")
 def login_instructor(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
     # Try DB first
     coach = _login_lookup(db, Instructor, code)
 
-    # Fallback to env code (persist it so future logins hit DB path)
+    # Fallback to env var (INSTRUCTOR_DEFAULT_CODE)
     if not coach:
         env_code = os.getenv("INSTRUCTOR_DEFAULT_CODE", "")
         if env_code and normalize_code(code) == normalize_code(env_code):
@@ -327,14 +333,12 @@ def login_instructor(request: Request, code: str = Form(...), db: Session = Depe
     request.session.pop("player_id", None)
     return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
 
-
 @app.get("/logout")
 def logout(request: Request):
     request.session.pop("player_id", None)
     request.session.pop("instructor_id", None)
     set_flash(request, "You have been logged out.")
     return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-
 
 # ------------------------- Player dashboard -----------------------------------
 @app.get("/dashboard")
@@ -373,7 +377,6 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     }
     return templates.TemplateResponse("dashboard.html", ctx)
 
-
 # ------------------------- Instructor views -----------------------------------
 @app.get("/instructor")
 def instructor_home(request: Request, db: Session = Depends(get_db)):
@@ -400,20 +403,18 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
             )
         ).all()
     else:
-        # If somehow recorded_at is missing (shouldn't be after _ensure_schema), still be safe.
         rows = db.execute(
             select(Player, text("NULL as last_metric_at")).order_by(Player.id.desc())
         ).all()
 
-    # Build grouped = {bucket: [(player, sessions, is_fav), ...]}
     session_counts = _session_counts_by_player(db)
     grouped = _group_players(rows, session_counts)
 
-    # Keep 'players' for any older templates that still reference it (list of dicts)
+    # Keep 'players' (list of dicts) for older templates if they exist
     players = []
     for p, last_raw in rows:
         players.append({
-            "player": p,
+            "player": _player_to_dict(p),
             "last_update": _parse_dt_from_db(last_raw),
         })
 
@@ -424,7 +425,6 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         "grouped": grouped,
     }
     return templates.TemplateResponse("instructor_dashboard.html", ctx)
-
 
 @app.get("/instructor/player/{player_id}")
 def instructor_player_detail(player_id: int, request: Request, db: Session = Depends(get_db)):
@@ -453,7 +453,6 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
         "assignments": assignments,
     }
     return templates.TemplateResponse("instructor_player_detail.html", ctx)
-
 
 # ------------------------- Instructor actions (writes) -------------------------
 @app.post("/instructor/player/{player_id}/metric")
@@ -487,7 +486,6 @@ def add_metric(
     db.commit()
     return JSONResponse({"ok": True})
 
-
 @app.post("/instructor/player/{player_id}/note")
 def add_note(
     player_id: int,
@@ -511,7 +509,6 @@ def add_note(
     db.commit()
     return JSONResponse({"ok": True})
 
-
 @app.post("/instructor/player/{player_id}/assign_drill")
 def assign_drill(
     player_id: int,
@@ -533,7 +530,6 @@ def assign_drill(
     db.add(a)
     db.commit()
     return JSONResponse({"ok": True})
-
 
 # ------------------------- Health check ---------------------------------------
 @app.get("/healthz")

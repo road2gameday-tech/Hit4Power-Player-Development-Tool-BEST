@@ -1,7 +1,7 @@
 # app/main.py
 import os
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
@@ -10,7 +10,7 @@ from starlette.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from starlette import status
 
-from sqlalchemy import func, select, and_, inspect, text
+from sqlalchemy import func, select, and_, text, inspect
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -196,7 +196,7 @@ def _parse_iso_dt(value: Optional[str]) -> datetime:
 
 def _parse_dt_from_db(val: Optional[str]) -> Optional[datetime]:
     """
-    Parse DB timestamp strings (SQLite's 'YYYY-MM-DD HH:MM:SS' or ISO8601) into datetime.
+    Parse DB timestamp strings (SQLite 'YYYY-MM-DD HH:MM:SS' or ISO8601) into datetime.
     Returns None if parsing fails.
     """
     if not val:
@@ -205,13 +205,13 @@ def _parse_dt_from_db(val: Optional[str]) -> Optional[datetime]:
         return val
     s = str(val).strip()
     try:
-        # Try plain ISO 8601 first (handles 'YYYY-MM-DDTHH:MM:SS[+00:00]')
+        # ISO 8601 (handles 'YYYY-MM-DDTHH:MM:SS[+00:00]')
         if s.endswith("Z"):
             s = s.replace("Z", "+00:00")
         return datetime.fromisoformat(s)
     except Exception:
         pass
-    # Try common SQLite format 'YYYY-MM-DD HH:MM:SS'
+    # SQLite common format 'YYYY-MM-DD HH:MM:SS'
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except Exception:
@@ -222,8 +222,7 @@ def _bucket_by_recency(dt: Optional[datetime]) -> str:
     if not dt:
         return "No data yet"
     now = datetime.utcnow()
-    delta = now - dt
-    days = delta.days
+    days = (now - dt).days
     if days <= 0:
         return "Updated today"
     if days <= 7:
@@ -233,21 +232,52 @@ def _bucket_by_recency(dt: Optional[datetime]) -> str:
     return "Stale (30+ days)"
 
 
-def _group_players(rows: List) -> Dict[str, list]:
+def _session_counts_by_player(db: Session) -> Dict[int, int]:
     """
-    rows: sequence of (Player, last_metric_at) where last_metric_at may be None or a str/datetime.
-    returns: dict bucket -> list of {player, last_update (datetime|None)}
+    Compute number of distinct metric days per player (i.e., 'sessions').
+    Uses recorded_at (added/backfilled in _ensure_schema).
     """
-    grouped: Dict[str, list] = {}
-    for r in rows:
-        player = r[0]
-        last_at_raw = None if len(r) < 2 else r[1]
-        last_at = _parse_dt_from_db(last_at_raw)
-        bucket = _bucket_by_recency(last_at)
-        grouped.setdefault(bucket, []).append({"player": player, "last_update": last_at})
-    # Stable sort within each bucket: by last_update desc, then id desc
-    for bucket, arr in grouped.items():
-        arr.sort(key=lambda x: ((x["last_update"] or datetime(1970, 1, 1)), x["player"].id), reverse=True)
+    counts: Dict[int, int] = {}
+    if not _has_column("metrics", "recorded_at"):
+        # Extremely defensive: if somehow absent, just count rows.
+        rows = db.execute(
+            select(Metric.player_id, func.count(Metric.id)).group_by(Metric.player_id)
+        ).all()
+        for pid, c in rows:
+            counts[int(pid)] = int(c)
+        return counts
+
+    rows = db.execute(
+        select(
+            Metric.player_id,
+            func.count(func.distinct(func.date(Metric.recorded_at)))
+        ).group_by(Metric.player_id)
+    ).all()
+    for pid, c in rows:
+        counts[int(pid)] = int(c)
+    return counts
+
+
+def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dict[int, int]) -> Dict[str, List[Tuple[Player, int, bool]]]:
+    """
+    rows: sequence of (Player, last_metric_at)
+    returns: dict bucket -> list of (player, sessions_int, is_fav_bool)
+    """
+    grouped: Dict[str, List[Tuple[Player, int, bool]]] = {}
+
+    # Pre-parse and sort by last_update desc then id desc, so groups keep nice order
+    parsed = []
+    for p, last_raw in rows:
+        last_dt = _parse_dt_from_db(last_raw)
+        parsed.append((p, last_dt))
+    parsed.sort(key=lambda x: ((x[1] or datetime(1970, 1, 1)), x[0].id), reverse=True)
+
+    for p, last_dt in parsed:
+        bucket = _bucket_by_recency(last_dt)
+        sessions = session_counts.get(p.id, 0)
+        is_fav = False  # No 'favorite' flag in schema; template expects a third value.
+        grouped.setdefault(bucket, []).append((p, sessions, is_fav))
+
     return grouped
 
 
@@ -351,6 +381,7 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         set_flash(request, "Please log in as an instructor.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
+    # Determine last metric time per player
     if _has_column("metrics", "recorded_at"):
         last_metric_subq = (
             select(
@@ -363,23 +394,28 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         rows = db.execute(
             select(Player, last_metric_subq.c.last_metric_at)
             .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
-            # Sort by "last updated" (NULLs last), then newest Player ID
             .order_by(
                 func.coalesce(last_metric_subq.c.last_metric_at, text("'1970-01-01 00:00:00'")).desc(),
                 Player.id.desc(),
             )
         ).all()
     else:
-        # No usable timestamp on metrics yet; list players newest first with NULL last_metric_at
+        # If somehow recorded_at is missing (shouldn't be after _ensure_schema), still be safe.
         rows = db.execute(
-            select(Player, text("NULL as last_metric_at"))
-            .order_by(Player.id.desc())
+            select(Player, text("NULL as last_metric_at")).order_by(Player.id.desc())
         ).all()
 
-    grouped = _group_players(rows)
+    # Build grouped = {bucket: [(player, sessions, is_fav), ...]}
+    session_counts = _session_counts_by_player(db)
+    grouped = _group_players(rows, session_counts)
 
-    # Keep 'players' for templates that still reference it, but also supply 'grouped'
-    players = [{"player": r[0], "last_update": _parse_dt_from_db(r[1] if len(r) > 1 else None)} for r in rows]
+    # Keep 'players' for any older templates that still reference it (list of dicts)
+    players = []
+    for p, last_raw in rows:
+        players.append({
+            "player": p,
+            "last_update": _parse_dt_from_db(last_raw),
+        })
 
     ctx = {
         "request": request,

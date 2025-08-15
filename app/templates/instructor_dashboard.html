@@ -3,8 +3,10 @@
 {% block content %}
   <div class="toolbar">
     <h2>Clients</h2>
-    <a href="#myclients" class="btn btn-ghost">My Clients <span class="badge">{{ my_clients_count }}</span></a>
-  </div>
+<nav class="tabs mb-2">
+  <a class="tab{% if filter == 'favorites' %} active{% endif %}" href="/instructor?filter=favorites">My Clients</a>
+  <a class="tab{% if filter != 'favorites' %} active{% endif %}" href="/instructor?filter=all">All Clients</a>
+</nav>
 
   <div class="grid two">
     <section class="card">
@@ -59,7 +61,7 @@
               <div class="name">{{ p.name }}</div>
               <div class="muted">Sessions: {{ p.metrics|length }}</div>
             </div>
-            <button class="star" data-player="{{ p.id }}" aria-label="Favorite">
+            <button class="star" data-player="{{ p.id }}" aria-label="My Client">
               <span class="star-shape {% if is_fav %}on{% endif %}">★</span>
             </button>
           </a>

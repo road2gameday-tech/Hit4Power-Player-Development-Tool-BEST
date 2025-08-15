@@ -38,6 +38,52 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
+from datetime import datetime, timezone
+
+def _parse_any_dt(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    # support trailing Z
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        # last-ditch common format
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt)
+            except Exception:
+                pass
+    return None
+
+def _datetimeformat_filter(value, fmt="%b %d, %Y"):
+    dt = _parse_any_dt(value)
+    return dt.strftime(fmt) if dt else ""
+
+def _ago_filter(value):
+    dt = _parse_any_dt(value)
+    if not dt:
+        return ""
+    now = datetime.now(dt.tzinfo or timezone.utc) if dt.tzinfo else datetime.utcnow()
+    seconds = int((now - dt).total_seconds())
+    for name, secs in (("year", 31536000), ("month", 2592000), ("week", 604800),
+                       ("day", 86400), ("hour", 3600), ("minute", 60)):
+        n = seconds // secs
+        if n >= 1:
+            return f"{n} {name}{'' if n == 1 else 's'} ago"
+    return "just now"
+
+# Register filters for all templates
+templates.env.filters["datetimeformat"] = _datetimeformat_filter
+templates.env.filters["ago"] = _ago_filter
+
+
 # Create missing **tables** (not columns)
 Base.metadata.create_all(bind=engine)
 

@@ -391,6 +391,7 @@ def toggle_favorite(request: Request, player_id: int):
 
 @app.get("/instructor/player/{player_id}")
 def instructor_player_detail(request: Request, player_id: int):
+    # must be logged in as instructor
     try:
         _require_instructor(request)
     except HTTPException:
@@ -398,11 +399,22 @@ def instructor_player_detail(request: Request, player_id: int):
 
     conn = get_db()
     try:
-        player = conn.execute("SELECT * FROM players WHERE id = ?", (player_id,)).fetchone()
+        # ensure rows are dict-like for Jinja access
+        try:
+            conn.row_factory = sqlite3.Row
+        except Exception:
+            pass
+        cur = conn.cursor()
+
+        # --- core data ---
+        player = cur.execute(
+            "SELECT * FROM players WHERE id = ?",
+            (player_id,),
+        ).fetchone()
         if not player:
             raise HTTPException(status_code=404, detail="Player not found")
 
-        metrics = conn.execute(
+        metrics_rows = cur.execute(
             """
             SELECT
                 COALESCE(date, recorded_at, substr(created_at, 1, 10)) AS date,
@@ -415,7 +427,7 @@ def instructor_player_detail(request: Request, player_id: int):
             (player_id,),
         ).fetchall()
 
-        notes = conn.execute(
+        notes = cur.execute(
             """
             SELECT text, shared, created_at
             FROM notes
@@ -426,12 +438,50 @@ def instructor_player_detail(request: Request, player_id: int):
             (player_id,),
         ).fetchall()
 
-        drills = conn.execute("SELECT id, title FROM drills ORDER BY title").fetchall()
+        drills = cur.execute(
+            "SELECT id, title FROM drills ORDER BY title"
+        ).fetchall()
 
-        ctx = {"request": request, "player": player, "metrics": metrics, "notes": notes, "drills": drills}
+        # --- chart arrays (oldest->newest for nicer charts) ---
+        def _label(v):
+            if isinstance(v, datetime):
+                return v.date().isoformat()
+            if isinstance(v, date):
+                return v.isoformat()
+            if v is None:
+                return ""
+            s = str(v)
+            # trim to YYYY-MM-DD if a timestamp came back
+            return s[:10] if len(s) >= 10 and s[4] == "-" and s[7] == "-" else s
+
+        dates, exitv, launch, spin = [], [], [], []
+        for m in reversed(list(metrics_rows)):  # reverse DESC -> chronological
+            # sqlite3.Row or tuple-safe access
+            row = m
+            get = (lambda k: row[k]) if isinstance(row, dict) or hasattr(row, "keys") else (lambda k: row[0])
+            d = row["date"] if isinstance(row, sqlite3.Row) or hasattr(row, "keys") else m[0]
+
+            dates.append(_label(d))
+            exitv.append(float((row["exit_velocity"] if hasattr(row, "keys") else m[1]) or 0))
+            launch.append(float((row["launch_angle"]  if hasattr(row, "keys") else m[2]) or 0))
+            spin.append(float((row["spin_rate"]     if hasattr(row, "keys") else m[3]) or 0))
+
+        ctx = {
+            "request": request,
+            "player": player,
+            "metrics": metrics_rows,
+            "notes": notes,
+            "drills": drills,
+            # chart data for template <script> using |tojson
+            "dates": dates,
+            "exitv": exitv,
+            "launch": launch,
+            "spin": spin,
+        }
         return templates.TemplateResponse("instructor_player_detail.html", ctx)
     finally:
         conn.close()
+
 
 @app.post("/metrics/add")
 def add_metrics(

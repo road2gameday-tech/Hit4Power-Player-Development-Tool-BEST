@@ -10,16 +10,13 @@ from starlette.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 from starlette import status
 
-from sqlalchemy import func, select, and_
+from sqlalchemy import func, select, and_, inspect, text
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
 from .database import SessionLocal, engine, Base
-from .models import (
-    Player, Instructor, Metric, Note, DrillAssignment
-)
-from .utils import (
-    normalize_code, hash_code, set_flash, pop_flash, age_bucket
-)
+from .models import Player, Instructor, Metric, Note, DrillAssignment
+from .utils import normalize_code, hash_code, set_flash, pop_flash, age_bucket
 
 # ------------------------------------------------------------------------------
 # App setup
@@ -28,8 +25,7 @@ app = FastAPI()
 
 # Sessions (required for flash + auth)
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-insecure-session-secret")
-# Set https_only=True in prod (Render terminates TLS at the proxy; downstream is HTTP).
-HTTPS_ONLY = os.getenv("ENV", "dev") != "dev"
+HTTPS_ONLY = os.getenv("ENV", "dev") != "dev"  # set ENV=prod on Render to enable secure cookies
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
@@ -45,6 +41,22 @@ templates = Jinja2Templates(directory="app/templates")
 # Create tables if they don't exist (ok for demo; prefer Alembic migrations for prod)
 Base.metadata.create_all(bind=engine)
 
+# --- Ensure schema is compatible with current models (adds instructors.login_code if missing) ---
+def _ensure_schema():
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("instructors")}
+    except Exception as e:
+        print(f"[ensure_schema] cannot inspect instructors table: {e}")
+        return
+    if "login_code" not in cols:
+        dialect = engine.dialect.name
+        stmt = "ALTER TABLE instructors ADD COLUMN login_code TEXT"
+        if dialect == "postgresql":
+            stmt = "ALTER TABLE instructors ADD COLUMN IF NOT EXISTS login_code TEXT"
+        with engine.begin() as conn:
+            conn.execute(text(stmt))
+        print("[ensure_schema] added instructors.login_code")
+_ensure_schema()
 
 # ------------------------------------------------------------------------------
 # DB dependency
@@ -56,37 +68,26 @@ def get_db():
     finally:
         db.close()
 
-
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-from sqlalchemy.exc import OperationalError, ProgrammingError
-
 def _login_lookup(db: Session, model, raw_code: str):
+    """Try normalized plaintext, then hashed; swallow schema errors to avoid 500s."""
     norm = normalize_code(raw_code)
     try:
         obj = db.execute(select(model).where(model.login_code == norm)).scalar_one_or_none()
         if obj:
             return obj
         hashed = hash_code(raw_code)
-        obj = db.execute(select(model).where(model.login_code == hashed)).scalar_one_or_none()
-        return obj
+        return db.execute(select(model).where(model.login_code == hashed)).scalar_one_or_none()
     except (OperationalError, ProgrammingError) as e:
-        # Likely: column doesn't exist yet in your DB schema.
-        # Log it and fall through to "invalid code" behavior.
-        print(f"[login_lookup] schema issue: {e}")  # or use logging
+        print(f"[login_lookup] schema issue: {e}")
         return None
 
-
 def _latest_metrics_query(player_id: int):
-    """
-    Select newest row per (player_id, metric). Use for “Latest metrics” on dashboards.
-    """
+    """Newest row per (player_id, metric) for dashboard 'Latest metrics'."""
     subq = (
-        select(
-            Metric.metric.label("metric"),
-            func.max(Metric.recorded_at).label("latest"),
-        )
+        select(Metric.metric.label("metric"), func.max(Metric.recorded_at).label("latest"))
         .where(Metric.player_id == player_id)
         .group_by(Metric.metric)
         .subquery()
@@ -98,11 +99,8 @@ def _latest_metrics_query(player_id: int):
         .order_by(Metric.metric.asc())
     )
 
-
 def _parse_iso_dt(value: Optional[str]) -> datetime:
-    """
-    Parse ISO8601 timestamps including 'Z' suffix; default to now if empty.
-    """
+    """Parse ISO8601 timestamps including 'Z' suffix; default to now if empty/invalid."""
     if not value:
         return datetime.utcnow()
     v = value.strip()
@@ -113,7 +111,6 @@ def _parse_iso_dt(value: Optional[str]) -> datetime:
     except Exception:
         return datetime.utcnow()
 
-
 # ------------------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------------------
@@ -122,40 +119,33 @@ def index(request: Request):
     ctx = {"request": request, "flash": pop_flash(request)}
     return templates.TemplateResponse("index.html", ctx)
 
-
 @app.post("/login/player")
 def login_player(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
     player = _login_lookup(db, Player, code)
     if not player:
         set_flash(request, "Invalid code. Please try again.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-
     request.session["player_id"] = player.id
     request.session.pop("instructor_id", None)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
-
 @app.post("/login/instructor")
 def login_instructor(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
-    # 1) Try DB-based login first
+    # First try DB
     coach = _login_lookup(db, Instructor, code)
 
-    # 2) If not found, honor INSTRUCTOR_DEFAULT_CODE as a fallback
+    # Fallback to env var: INSTRUCTOR_DEFAULT_CODE
     if not coach:
         env_code = os.getenv("INSTRUCTOR_DEFAULT_CODE", "")
         if env_code and normalize_code(code) == normalize_code(env_code):
-            # Find-or-create a default instructor bound to this env code
             coach = db.execute(select(Instructor).order_by(Instructor.id.asc())).scalar_one_or_none()
             if not coach:
-                # Store the normalized code (or hash_code(env_code) if you prefer hashing)
                 coach = Instructor(name="Default Instructor", login_code=normalize_code(env_code))
                 db.add(coach)
                 db.commit()
-            else:
-                # Ensure login_code is set so future DB lookups succeed
-                if not coach.login_code:
-                    coach.login_code = normalize_code(env_code)
-                    db.commit()
+            elif not coach.login_code:
+                coach.login_code = normalize_code(env_code)
+                db.commit()
 
     if not coach:
         set_flash(request, "Invalid code. Please try again.")
@@ -165,15 +155,12 @@ def login_instructor(request: Request, code: str = Form(...), db: Session = Depe
     request.session.pop("player_id", None)
     return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
 
-
-
 @app.get("/logout")
 def logout(request: Request):
     request.session.pop("player_id", None)
     request.session.pop("instructor_id", None)
     set_flash(request, "You have been logged out.")
     return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-
 
 # ------------------------- Player dashboard -----------------------------------
 @app.get("/dashboard")
@@ -189,14 +176,9 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
     latest_metrics = db.execute(_latest_metrics_query(pid)).scalars().all()
-
     last_note = db.execute(
-        select(Note)
-        .where(Note.player_id == pid, Note.shared == True)  # noqa: E712
-        .order_by(Note.created_at.desc())
-        .limit(1)
+        select(Note).where(Note.player_id == pid, Note.shared == True).order_by(Note.created_at.desc()).limit(1)
     ).scalar_one_or_none()
-
     drills = db.execute(
         select(DrillAssignment)
         .where(DrillAssignment.player_id == pid, DrillAssignment.status != "archived")
@@ -214,38 +196,29 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
     }
     return templates.TemplateResponse("dashboard.html", ctx)
 
-
 # ------------------------- Instructor views -----------------------------------
 @app.get("/instructor")
 def instructor_home(request: Request, db: Session = Depends(get_db)):
-    iid = request.session.get("instructor_id")
-    if not iid:
+    if not request.session.get("instructor_id"):
         set_flash(request, "Please log in as an instructor.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
-    # Last metric per player (timestamp)
     last_metric_subq = (
-        select(
-            Metric.player_id.label("pid"),
-            func.max(Metric.recorded_at).label("last_metric_at"),
-        )
+        select(Metric.player_id.label("pid"), func.max(Metric.recorded_at).label("last_metric_at"))
         .group_by(Metric.player_id)
         .subquery()
     )
 
-    # Order by "last updated metric" DESC; then player id DESC as a stable tie-breaker
+    # Avoid NULLS LAST (not supported in SQLite). Coalesce NULL to a very old date so they sort to the bottom.
     rows = db.execute(
         select(Player, last_metric_subq.c.last_metric_at)
         .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
-        .order_by(last_metric_subq.c.last_metric_at.desc().nulls_last(), Player.id.desc())
+        .order_by(func.coalesce(last_metric_subq.c.last_metric_at, datetime(1970, 1, 1)).desc(), Player.id.desc())
     ).all()
 
     players = [{"player": r[0], "last_update": r[1]} for r in rows]
-
     ctx = {"request": request, "flash": pop_flash(request), "players": players}
     return templates.TemplateResponse("instructor_dashboard.html", ctx)
-
-
 
 @app.get("/instructor/player/{player_id}")
 def instructor_player_detail(player_id: int, request: Request, db: Session = Depends(get_db)):
@@ -262,9 +235,7 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
         select(Note).where(Note.player_id == player_id).order_by(Note.created_at.desc()).limit(25)
     ).scalars().all()
     assignments = db.execute(
-        select(DrillAssignment)
-        .where(DrillAssignment.player_id == player_id)
-        .order_by(DrillAssignment.created_at.desc())
+        select(DrillAssignment).where(DrillAssignment.player_id == player_id).order_by(DrillAssignment.created_at.desc())
     ).scalars().all()
 
     ctx = {
@@ -276,7 +247,6 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
         "assignments": assignments,
     }
     return templates.TemplateResponse("instructor_player_detail.html", ctx)
-
 
 # ------------------------- Instructor actions (writes) -------------------------
 @app.post("/instructor/player/{player_id}/metric")
@@ -297,7 +267,6 @@ def add_metric(
         return JSONResponse({"ok": False, "error": "player_not_found"}, status_code=404)
 
     when = _parse_iso_dt(recorded_at)
-
     m = Metric(
         player_id=player_id,
         metric=metric.strip().lower(),
@@ -310,7 +279,6 @@ def add_metric(
     db.add(m)
     db.commit()
     return JSONResponse({"ok": True})
-
 
 @app.post("/instructor/player/{player_id}/note")
 def add_note(
@@ -335,7 +303,6 @@ def add_note(
     db.commit()
     return JSONResponse({"ok": True})
 
-
 @app.post("/instructor/player/{player_id}/assign_drill")
 def assign_drill(
     player_id: int,
@@ -357,7 +324,6 @@ def assign_drill(
     db.add(a)
     db.commit()
     return JSONResponse({"ok": True})
-
 
 # ------------------------- Health check ---------------------------------------
 @app.get("/healthz")

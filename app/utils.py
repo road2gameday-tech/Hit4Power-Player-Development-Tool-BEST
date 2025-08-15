@@ -6,6 +6,15 @@ import random
 import string
 from typing import Optional
 
+# -------- Flash helpers (session-based) --------
+def set_flash(request, message: str):
+    """Store a single flash message in the session."""
+    request.session["flash"] = message
+
+def pop_flash(request):
+    """Retrieve & remove the flash message from the session."""
+    return request.session.pop("flash", None)
+
 
 # -------- Code generation & normalization --------
 

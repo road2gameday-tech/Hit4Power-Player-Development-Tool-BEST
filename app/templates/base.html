@@ -6,25 +6,11 @@
     <meta name="color-scheme" content="dark light" />
     <title>{{ title or "Hit4Power" }}</title>
 
-    <!-- Core styles -->
-    <link rel="stylesheet" href="{{ url_for('static', path='css/style.css') }}" />
+    <link rel="stylesheet" href="{{ request.url_for('static', path='css/style.css') }}">
+    <link rel="preload" as="image" href="{{ request.url_for('static', path='logos/Hit4PowerMainLogoDark.png') }}">
+    <script defer src="{{ request.url_for('static', path='js/main.js') }}"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 
-    <!-- Preload logo for faster first paint -->
-    <link rel="preload" as="image" href="{{ url_for('static', path='logos/Hit4PowerMainLogoDark.png') }}" />
-
-    <!-- App script (theme toggle, etc.) -->
-    <script defer src="{{ url_for('static', path='js/main.js') }}"></script>
-
-    <!-- Chart.js (pinned + SRI). If you vendor it locally later, swap to url_for('static', ...) -->
-    <script
-      defer
-      src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"
-      integrity="sha384-fC4c0tK0yS8pP9y/1mipfLQm7m9uAk7Wc8J2sR6uRZ0g7rF6o4R2tQxq3oR4lF4Z"
-      crossorigin="anonymous"
-      referrerpolicy="no-referrer"
-    ></script>
-
-    {# Optional page-specific head content #}
     {% block extra_head %}{% endblock %}
   </head>
   <body class="page">
@@ -33,15 +19,11 @@
     <header class="header" role="banner">
       <div class="header-left">
         <a href="/" class="logo-link" aria-label="Hit4Power home">
-          <img
-            id="site-logo"
-            src="{{ url_for('static', path='logos/Hit4PowerMainLogoDark.png') }}"
-            alt="Hit4Power"
-            class="logo"
-          />
+          <img id="site-logo"
+               src="{{ request.url_for('static', path='logos/Hit4PowerMainLogoDark.png') }}"
+               alt="Hit4Power" class="logo" />
         </a>
       </div>
-
       <nav class="nav" aria-label="Primary">
         {% if request.session.get('instructor_id') %}
           <a href="/instructor" class="nav-link">Clients</a>
@@ -57,7 +39,6 @@
     </header>
 
     <main id="main" class="container" role="main">
-      {% set flash = pop_flash(request) %}
       {% if flash %}
         <div class="flash" role="status" aria-live="polite">{{ flash }}</div>
       {% endif %}
@@ -72,7 +53,6 @@
       </div>
     </footer>
 
-    {# Optional page-specific scripts #}
     {% block extra_scripts %}{% endblock %}
   </body>
 </html>

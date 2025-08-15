@@ -543,29 +543,60 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         .order_by(DrillAssignment.created_at.desc())
     ).scalars().all()
     
- # --- NEW: chart data so Jinja |tojson never sees Undefined
-    dates, ev_series, la_series, sr_series = _chart_series(db, pid)
-    # Provide multiple aliases to match whatever the template expects
-    chart_ctx = {
-        "dates": dates,
-        "ev_series": ev_series, "la_series": la_series, "sr_series": sr_series,
-        "ev": ev_series, "la": la_series, "sr": sr_series,
-        "ev_values": ev_series, "la_values": la_series, "sr_values": sr_series,
-        "values": ev_series,  # generic alias some templates use
-    }
-    # --- END NEW
-    
-    ctx = {
-        "request": request,
-        "flash": pop_flash(request),
-        "player": player,
-        "age_bucket": age_bucket(player.age),
-        "latest_metrics": latest_metrics,
-        "last_note": last_note,
-        "drill_assignments": drills,
-         **chart_ctx,  # NEW
-    }
-    return templates.TemplateResponse("dashboard.html", ctx)
+# --- chart data so Jinja |tojson never sees Undefined
+dates, ev_series, la_series, sr_series = _chart_series(db, pid)
+
+# Normalize Nones in series to 0s (optional but helps chart libs)
+ev_series = [(v if v is not None else 0) for v in ev_series]
+la_series = [(v if v is not None else 0) for v in la_series]
+sr_series = [(v if v is not None else 0) for v in sr_series]
+
+# Provide MANY aliases so any template key works
+chart_ctx = {
+    # labels
+    "dates": dates,
+    "labels": dates,
+
+    # exit velocity (template asks for "exitv")
+    "exitv": ev_series,              # <— the one your template expects
+    "ev": ev_series,
+    "ev_series": ev_series,
+    "ev_values": ev_series,
+    "exit_velocity": ev_series,
+    "exit_velocity_values": ev_series,
+
+    # launch angle
+    "la": la_series,
+    "la_series": la_series,
+    "la_values": la_series,
+    "launch_angle": la_series,
+    "launch_angle_values": la_series,
+
+    # spin rate
+    "sr": sr_series,
+    "sr_series": sr_series,
+    "sr_values": sr_series,
+    "spin_rate": sr_series,
+    "spin_rate_values": sr_series,
+
+    # very generic fallbacks some templates use
+    "values": ev_series,
+    "series": ev_series,
+}
+# --- END chart data
+
+ctx = {
+    "request": request,
+    "flash": pop_flash(request),
+    "player": player,
+    "age_bucket": age_bucket(player.age),
+    "latest_metrics": latest_metrics,
+    "last_note": last_note,
+    "drill_assignments": drills,
+    **chart_ctx,  # ← keep this
+}
+return templates.TemplateResponse("dashboard.html", ctx)
+
 
 # ------------------------- Instructor views -----------------------------------
 @app.get("/instructor")

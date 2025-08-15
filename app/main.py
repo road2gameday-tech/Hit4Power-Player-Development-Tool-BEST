@@ -344,6 +344,7 @@ def assign_drill(
 # -----------------------------------------------------------------------------
 @app.get("/instructor")
 def instructor_home(request: Request):
+    # must be logged in as instructor
     try:
         _require_instructor(request)
     except HTTPException:
@@ -354,39 +355,46 @@ def instructor_home(request: Request):
         instructor_id = request.session.get("instructor_id")
         view = request.query_params.get("filter", "all")  # "all" | "favorites"
 
-        if view == "favorites":
-            players = conn.execute(
-                """
-                SELECT p.*,
-                       1 AS is_favorite
-                  FROM players p
-                  JOIN instructor_favorites f
-                    ON f.player_id = p.id
-                 WHERE f.instructor_id = ?
-                 ORDER BY p.name
-                """,
-                (instructor_id,),
-            ).fetchall()
-        else:
-            # all players, annotate favorite state for star toggles
-            players = conn.execute(
-                """
-                SELECT p.*,
-                       EXISTS (
-                         SELECT 1 FROM instructor_favorites f
-                          WHERE f.player_id = p.id
-                            AND f.instructor_id = ?
-                       ) AS is_favorite
-                  FROM players p
-                 ORDER BY p.name
-                """,
-                (instructor_id,),
-            ).fetchall()
+        # Pull all players and annotate favorite status using the correct table
+        all_players = conn.execute(
+            """
+            SELECT p.*,
+                   EXISTS (
+                       SELECT 1
+                       FROM instructor_favorites f
+                       WHERE f.player_id = p.id
+                         AND f.instructor_id = ?
+                   ) AS is_favorite
+            FROM players p
+            ORDER BY p.name
+            """,
+            (instructor_id,),
+        ).fetchall()
 
-        ctx = {"request": request, "players": players, "filter": view}
+        # Slice out favorites for “My Clients”
+        fav_players = [r for r in all_players if r["is_favorite"]]
+
+        # Build the buckets the template loops over: grouped.items()
+        if view == "favorites":
+            grouped = {"My Clients": fav_players}
+            players = fav_players
+        else:
+            grouped = {}
+            if fav_players:
+                grouped["My Clients"] = fav_players
+            grouped["All Players"] = all_players
+            players = all_players
+
+        ctx = {
+            "request": request,
+            "players": players,   # some templates may use this
+            "grouped": grouped,   # instructor_dashboard.html expects this
+            "filter": view,
+        }
         return templates.TemplateResponse("instructor_dashboard.html", ctx)
     finally:
         conn.close()
+
 
 # Convenience route so "My Clients" can point here directly
 @app.get("/instructor/clients")

@@ -1,7 +1,7 @@
 # app/main.py
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Dict, List
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
@@ -194,6 +194,63 @@ def _parse_iso_dt(value: Optional[str]) -> datetime:
         return datetime.utcnow()
 
 
+def _parse_dt_from_db(val: Optional[str]) -> Optional[datetime]:
+    """
+    Parse DB timestamp strings (SQLite's 'YYYY-MM-DD HH:MM:SS' or ISO8601) into datetime.
+    Returns None if parsing fails.
+    """
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    s = str(val).strip()
+    try:
+        # Try plain ISO 8601 first (handles 'YYYY-MM-DDTHH:MM:SS[+00:00]')
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
+        pass
+    # Try common SQLite format 'YYYY-MM-DD HH:MM:SS'
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _bucket_by_recency(dt: Optional[datetime]) -> str:
+    if not dt:
+        return "No data yet"
+    now = datetime.utcnow()
+    delta = now - dt
+    days = delta.days
+    if days <= 0:
+        return "Updated today"
+    if days <= 7:
+        return "Updated this week"
+    if days <= 30:
+        return "Updated this month"
+    return "Stale (30+ days)"
+
+
+def _group_players(rows: List) -> Dict[str, list]:
+    """
+    rows: sequence of (Player, last_metric_at) where last_metric_at may be None or a str/datetime.
+    returns: dict bucket -> list of {player, last_update (datetime|None)}
+    """
+    grouped: Dict[str, list] = {}
+    for r in rows:
+        player = r[0]
+        last_at_raw = None if len(r) < 2 else r[1]
+        last_at = _parse_dt_from_db(last_at_raw)
+        bucket = _bucket_by_recency(last_at)
+        grouped.setdefault(bucket, []).append({"player": player, "last_update": last_at})
+    # Stable sort within each bucket: by last_update desc, then id desc
+    for bucket, arr in grouped.items():
+        arr.sort(key=lambda x: ((x["last_update"] or datetime(1970, 1, 1)), x["player"].id), reverse=True)
+    return grouped
+
+
 # ------------------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------------------
@@ -306,21 +363,30 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         rows = db.execute(
             select(Player, last_metric_subq.c.last_metric_at)
             .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
-            # SQLite has no NULLS LAST; coalesce to an old date so NULLs sort last
+            # Sort by "last updated" (NULLs last), then newest Player ID
             .order_by(
                 func.coalesce(last_metric_subq.c.last_metric_at, text("'1970-01-01 00:00:00'")).desc(),
                 Player.id.desc(),
             )
         ).all()
     else:
-        # No usable timestamp on metrics yet; list players newest first.
+        # No usable timestamp on metrics yet; list players newest first with NULL last_metric_at
         rows = db.execute(
             select(Player, text("NULL as last_metric_at"))
             .order_by(Player.id.desc())
         ).all()
 
-    players = [{"player": r[0], "last_update": None if len(r) == 1 else r[1]} for r in rows]
-    ctx = {"request": request, "flash": pop_flash(request), "players": players}
+    grouped = _group_players(rows)
+
+    # Keep 'players' for templates that still reference it, but also supply 'grouped'
+    players = [{"player": r[0], "last_update": _parse_dt_from_db(r[1] if len(r) > 1 else None)} for r in rows]
+
+    ctx = {
+        "request": request,
+        "flash": pop_flash(request),
+        "players": players,
+        "grouped": grouped,
+    }
     return templates.TemplateResponse("instructor_dashboard.html", ctx)
 
 
@@ -339,9 +405,7 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
         select(Note).where(Note.player_id == player_id).order_by(Note.created_at.desc()).limit(25)
     ).scalars().all()
     assignments = db.execute(
-        select(DrillAssignment)
-        .where(DrillAssignment.player_id == player_id)
-        .order_by(DrillAssignment.created_at.desc())
+        select(DrillAssignment).where(DrillAssignment.player_id == player_id).order_by(DrillAssignment.created_at.desc())
     ).scalars().all()
 
     ctx = {

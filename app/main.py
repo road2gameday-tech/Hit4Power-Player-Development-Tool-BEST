@@ -23,9 +23,8 @@ from .utils import normalize_code, hash_code, set_flash, pop_flash, age_bucket
 # ------------------------------------------------------------------------------
 app = FastAPI()
 
-# Sessions (required for flash + auth)
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-insecure-session-secret")
-HTTPS_ONLY = os.getenv("ENV", "dev") != "dev"  # set ENV=prod on Render to enable secure cookies
+HTTPS_ONLY = os.getenv("ENV", "dev") != "dev"  # set ENV=prod on Render for secure cookies
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
@@ -34,28 +33,57 @@ app.add_middleware(
     session_cookie="h4p_session",
 )
 
-# Static files & templates
+# Static & templates
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
-# Create tables if they don't exist (ok for demo; prefer Alembic migrations for prod)
+# Create missing **tables** (not columns)
 Base.metadata.create_all(bind=engine)
 
-# --- Ensure schema is compatible with current models (adds instructors.login_code if missing) ---
+# --- Ensure legacy DB has the columns your models expect ----------------------
 def _ensure_schema():
+    insp = inspect(engine)
     try:
-        cols = {c["name"] for c in inspect(engine).get_columns("instructors")}
+        instr_cols = {c["name"] for c in insp.get_columns("instructors")}
     except Exception as e:
-        print(f"[ensure_schema] cannot inspect instructors table: {e}")
-        return
-    if "login_code" not in cols:
-        dialect = engine.dialect.name
-        stmt = "ALTER TABLE instructors ADD COLUMN login_code TEXT"
-        if dialect == "postgresql":
-            stmt = "ALTER TABLE instructors ADD COLUMN IF NOT EXISTS login_code TEXT"
+        print(f"[ensure_schema] cannot inspect instructors: {e}")
+        instr_cols = set()
+
+    try:
+        player_cols = {c["name"] for c in insp.get_columns("players")}
+    except Exception as e:
+        print(f"[ensure_schema] cannot inspect players: {e}")
+        player_cols = set()
+
+    dialect = engine.dialect.name
+    def _add(tbl: str, ddl: str):
+        # SQLite: no IF NOT EXISTS on ADD COLUMN; we've checked above
+        stmt = ddl if dialect != "postgresql" else ddl.replace(" ADD COLUMN ", " ADD COLUMN IF NOT EXISTS ")
         with engine.begin() as conn:
             conn.execute(text(stmt))
-        print("[ensure_schema] added instructors.login_code")
+        print(f"[ensure_schema] {tbl}: applied -> {ddl}")
+
+    # Instructors: add missing columns
+    if "login_code" not in instr_cols:
+        _add("instructors", "ALTER TABLE instructors ADD COLUMN login_code TEXT")
+    if "created_at" not in instr_cols:
+        _add("instructors", "ALTER TABLE instructors ADD COLUMN created_at TEXT")
+    if "updated_at" not in instr_cols:
+        _add("instructors", "ALTER TABLE instructors ADD COLUMN updated_at TEXT")
+
+    # Players: add missing timestamp columns (models likely expect them)
+    if "created_at" not in player_cols:
+        _add("players", "ALTER TABLE players ADD COLUMN created_at TEXT")
+    if "updated_at" not in player_cols:
+        _add("players", "ALTER TABLE players ADD COLUMN updated_at TEXT")
+
+    # Backfill NULL timestamps so ORM/date formatting won't choke later
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE instructors SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE instructors SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE players SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE players SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+
 _ensure_schema()
 
 # ------------------------------------------------------------------------------
@@ -134,10 +162,11 @@ def login_instructor(request: Request, code: str = Form(...), db: Session = Depe
     # First try DB
     coach = _login_lookup(db, Instructor, code)
 
-    # Fallback to env var: INSTRUCTOR_DEFAULT_CODE
+    # Fallback to env var (INSTRUCTOR_DEFAULT_CODE)
     if not coach:
         env_code = os.getenv("INSTRUCTOR_DEFAULT_CODE", "")
         if env_code and normalize_code(code) == normalize_code(env_code):
+            # find-or-create a default instructor; persist the normalized code so future logins hit DB path
             coach = db.execute(select(Instructor).order_by(Instructor.id.asc())).scalar_one_or_none()
             if not coach:
                 coach = Instructor(name="Default Instructor", login_code=normalize_code(env_code))
@@ -209,11 +238,11 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         .subquery()
     )
 
-    # Avoid NULLS LAST (not supported in SQLite). Coalesce NULL to a very old date so they sort to the bottom.
+    # Coalesce NULLs to an old date for SQLite-friendly sort (no NULLS LAST support)
     rows = db.execute(
         select(Player, last_metric_subq.c.last_metric_at)
         .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
-        .order_by(func.coalesce(last_metric_subq.c.last_metric_at, datetime(1970, 1, 1)).desc(), Player.id.desc())
+        .order_by(func.coalesce(last_metric_subq.c.last_metric_at, text("'1970-01-01 00:00:00'")).desc(), Player.id.desc())
     ).all()
 
     players = [{"player": r[0], "last_update": r[1]} for r in rows]

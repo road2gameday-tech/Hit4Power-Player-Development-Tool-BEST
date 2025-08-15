@@ -150,19 +150,23 @@ def _ensure_schema():
         conn.execute(text("UPDATE notes SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
 
     # Drill assignments — make sure fields used in queries exist
-    if drills_cols:
-        if "status" not in drills_cols:
-            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN status TEXT")
-        if "note" not in drills_cols:
-            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN note TEXT")
-        if "created_at" not in drills_cols:
-            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN created_at TEXT")
-        if "updated_at" not in drills_cols:
-            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN updated_at TEXT")
-        with engine.begin() as conn:
-            conn.execute(text("UPDATE drill_assignments SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
-            conn.execute(text("UPDATE drill_assignments SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
-            conn.execute(text("UPDATE drill_assignments SET status = COALESCE(status, 'assigned')"))
+    drills_cols = cols("drill_assignments")
+    if "status" not in drills_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN status TEXT")
+    if "note" not in drills_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN note TEXT")
+    if "due_date" not in drills_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN due_date TEXT")
+    if "created_at" not in drills_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN created_at TEXT")
+    if "updated_at" not in drills_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN updated_at TEXT")
+
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE drill_assignments SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE drill_assignments SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE drill_assignments SET status = COALESCE(status, 'assigned')"))
+
 
     # Favorites mapping table (instructor <-> player)
     if not _has_table("favorites"):

@@ -8,6 +8,7 @@ import string
 from datetime import datetime, date
 from typing import Dict, List, Tuple
 
+from fastapi import Form
 from fastapi import FastAPI, Request, Form, HTTPException, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
@@ -314,50 +315,98 @@ def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/", status_code=303)
 
+@app.get("/drills")
+def drill_library(request: Request, player_id: int | None = None, q: str | None = None):
+    # Instructor-only drill library. If player_id is provided, show "Assign" buttons
+    try:
+        _require_instructor(request)
+    except HTTPException:
+        return RedirectResponse("/", status_code=303)
+
+    pattern = f"%{q}%" if q else "%"
+    conn = get_db()
+    try:
+        drills = conn.execute(
+            "SELECT id, title, COALESCE(description, '') AS description FROM drills WHERE title LIKE ? ORDER BY title",
+            (pattern,),
+        ).fetchall()
+
+        ctx = {"request": request, "drills": drills, "player_id": player_id, "q": q or ""}
+        return templates.TemplateResponse("drill_library.html", ctx)
+    finally:
+        conn.close()
+
+@app.post("/drills/assign")
+def assign_drill(request: Request, player_id: int = Form(...), drill_id: int = Form(...), note: str = Form("")):
+    try:
+        _require_instructor(request)
+    except HTTPException:
+        return RedirectResponse("/", status_code=303)
+
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO assignments (player_id, drill_id, note, status, created_at) VALUES (?, ?, ?, 'assigned', CURRENT_TIMESTAMP)",
+            (player_id, drill_id, note.strip() if note else None),
+        )
+        conn.commit()
+        return RedirectResponse(f"/instructor/player/{player_id}", status_code=303)
+    finally:
+        conn.close()
+
 # -----------------------------------------------------------------------------
 # Instructor dashboard & actions
 # -----------------------------------------------------------------------------
 @app.get("/instructor")
 def instructor_home(request: Request):
     try:
-        iid = _require_instructor(request)
+        _require_instructor(request)
     except HTTPException:
         return RedirectResponse("/", status_code=303)
 
     conn = get_db()
     try:
-        players = conn.execute(
-            "SELECT p.* FROM players p ORDER BY p.created_at DESC, p.id DESC"
-        ).fetchall()
+        instructor_id = request.session.get("instructor_id")
+        view = request.query_params.get("filter", "all")  # "all" | "favorites"
 
-        fav_rows = conn.execute(
-            "SELECT player_id FROM instructor_favorites WHERE instructor_id = ?", (iid,)
-        ).fetchall()
-        fav_set = {r["player_id"] for r in fav_rows}
+        if view == "favorites":
+            players = conn.execute(
+                """
+                SELECT p.*,
+                       1 AS is_favorite
+                  FROM players p
+                  JOIN favorites f
+                    ON f.player_id = p.id
+                 WHERE f.instructor_id = ?
+                 ORDER BY p.name
+                """,
+                (instructor_id,),
+            ).fetchall()
+        else:
+            # all players, but annotate favorite state for star toggles
+            players = conn.execute(
+                """
+                SELECT p.*,
+                       EXISTS (
+                         SELECT 1 FROM favorites f
+                          WHERE f.player_id = p.id
+                            AND f.instructor_id = ?
+                       ) AS is_favorite
+                  FROM players p
+                 ORDER BY p.name
+                """,
+                (instructor_id,),
+            ).fetchall()
 
-        player_ids = [p["id"] for p in players] or [-1]
-        placeholders = ",".join(["?"] * len(player_ids))
-        counts = {}
-        cur = conn.execute(
-            f"SELECT player_id, COUNT(*) AS c FROM metrics WHERE player_id IN ({placeholders}) GROUP BY player_id",
-            player_ids,
-        )
-        for r in cur.fetchall():
-            counts[r["player_id"]] = r["c"]
-
-        triples: List[Tuple[sqlite3.Row, int, bool]] = []
-        for p in players:
-            triples.append((p, counts.get(p["id"], 0), p["id"] in fav_set))
-
-        grouped: Dict[str, List[Tuple[sqlite3.Row, int, bool]]] = {
-            "Favorites": [t for t in triples if t[2]],
-            "All Players": triples,
+        ctx = {
+            "request": request,
+            "players": players,
+            "filter": view,
         }
-
-        ctx = {"request": request, "grouped": grouped}
         return templates.TemplateResponse("instructor_dashboard.html", ctx)
     finally:
         conn.close()
+
 
 @app.post("/players/create")
 def create_player(request: Request, name: str = Form(...)):

@@ -216,6 +216,30 @@ def _on_startup():
 # -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
+from fastapi import Response, HTTPException
+
+@app.get("/health", include_in_schema=False)
+def health():
+    # super cheap liveness check
+    return {"ok": True}
+
+@app.get("/ready", include_in_schema=False)
+def ready():
+    # verify we can reach SQLite (or your DB)
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1")
+        conn.close()
+        return {"ready": True}
+    except Exception as e:
+        # Surface a 503 so Render keeps probing until we’re actually ready
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    # Render/Google probe with HEAD; avoid template rendering here
+    return Response(status_code=200)
+
 def _make_login_code(conn: sqlite3.Connection, length: int = 6) -> str:
     for _ in range(64):
         code = "".join(random.choices(string.digits, k=length))

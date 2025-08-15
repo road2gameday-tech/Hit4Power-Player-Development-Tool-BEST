@@ -2,7 +2,7 @@
 import os
 import random
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Set
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
@@ -52,9 +52,15 @@ def _has_column(table: str, col: str) -> bool:
         print(f"[has_column] cannot inspect {table}: {e}")
         return False
 
+def _has_table(table: str) -> bool:
+    try:
+        return inspect(engine).has_table(table)
+    except Exception as e:
+        print(f"[has_table] cannot inspect {table}: {e}")
+        return False
 
 def _ensure_schema():
-    """Add legacy columns if missing (idempotent) and backfill recorded_at."""
+    """Add legacy columns if missing (idempotent) and backfill needed data."""
     insp = inspect(engine)
 
     def cols(table: str) -> set[str]:
@@ -67,6 +73,9 @@ def _ensure_schema():
     instr_cols = cols("instructors")
     player_cols = cols("players")
     metric_cols = cols("metrics")
+    notes_cols  = cols("notes")
+    drills_cols = cols("drill_assignments")
+
     dialect = engine.dialect.name
 
     def _add(table: str, ddl: str):
@@ -125,6 +134,49 @@ def _ensure_schema():
                     "UPDATE metrics SET recorded_at = COALESCE(recorded_at, CURRENT_TIMESTAMP)"
                 ))
         print("[ensure_schema] metrics: backfilled recorded_at")
+
+    # Notes — ensure kind/shared/timestamps exist so dashboard query won't 500
+    if "kind" not in notes_cols:
+        _add("notes", "ALTER TABLE notes ADD COLUMN kind TEXT")
+    if "shared" not in notes_cols:
+        _add("notes", "ALTER TABLE notes ADD COLUMN shared INTEGER")
+    if "created_at" not in notes_cols:
+        _add("notes", "ALTER TABLE notes ADD COLUMN created_at TEXT")
+    if "updated_at" not in notes_cols:
+        _add("notes", "ALTER TABLE notes ADD COLUMN updated_at TEXT")
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE notes SET shared = COALESCE(shared, 1)"))
+        conn.execute(text("UPDATE notes SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE notes SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+
+    # Drill assignments — make sure fields used in queries exist
+    if drills_cols:
+        if "status" not in drills_cols:
+            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN status TEXT")
+        if "note" not in drills_cols:
+            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN note TEXT")
+        if "created_at" not in drills_cols:
+            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN created_at TEXT")
+        if "updated_at" not in drills_cols:
+            _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN updated_at TEXT")
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE drill_assignments SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+            conn.execute(text("UPDATE drill_assignments SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+            conn.execute(text("UPDATE drill_assignments SET status = COALESCE(status, 'assigned')"))
+
+    # Favorites mapping table (instructor <-> player)
+    if not _has_table("favorites"):
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE favorites (
+                    instructor_id INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    PRIMARY KEY (instructor_id, player_id)
+                )
+            """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_favorites_instructor ON favorites (instructor_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_favorites_player ON favorites (player_id)"))
+        print("[ensure_schema] created favorites table")
 
     # Safety backfill for timestamps (idempotent)
     with engine.begin() as conn:
@@ -266,7 +318,18 @@ def _player_to_dict(p: Player) -> Dict[str, Optional[str]]:
         "updated_at": getattr(p, "updated_at", None),
     }
 
-def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dict[int, int]) -> Dict[str, List[Tuple[dict, int, bool]]]:
+def _get_favorites(db: Session, instructor_id: int) -> Set[int]:
+    rows = db.execute(
+        text("SELECT player_id FROM favorites WHERE instructor_id = :iid"),
+        {"iid": instructor_id}
+    ).all()
+    return {int(r[0]) for r in rows}
+
+def _group_players(
+    rows: List[Tuple[Player, Optional[str]]],
+    session_counts: Dict[int, int],
+    fav_ids: Optional[Set[int]] = None
+) -> Dict[str, List[Tuple[dict, int, bool]]]:
     """
     rows: sequence of (Player, last_metric_at)
     returns: dict bucket -> list of (player_dict_with_fake_metrics, sessions_int, is_fav_bool)
@@ -279,10 +342,12 @@ def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dic
         parsed.append((p, last_dt))
     parsed.sort(key=lambda x: ((x[1] or datetime(1970, 1, 1)), x[0].id), reverse=True)
 
+    fav_ids = fav_ids or set()
+
     for p, last_dt in parsed:
         bucket = _bucket_by_recency(last_dt)
         sessions = session_counts.get(p.id, 0)
-        is_fav = False  # no favorites field in schema
+        is_fav = p.id in fav_ids
         pdict = _player_to_dict(p)
         # Provide a synthetic "metrics" list so template can call p.metrics|length without DB hits
         pdict["metrics"] = [None] * sessions
@@ -298,7 +363,6 @@ def _generate_unique_code(db: Session, length: int = 6) -> str:
         exists = db.execute(select(Player).where(Player.login_code == norm)).scalar_one_or_none()
         if not exists:
             return code
-    # Fallback even if collision loop exhausted
     return "".join(random.choice(alphabet) for _ in range(length))
 
 # ------------------------------------------------------------------------------
@@ -420,7 +484,8 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         ).all()
 
     session_counts = _session_counts_by_player(db)
-    grouped = _group_players(rows, session_counts)
+    fav_ids = _get_favorites(db, request.session["instructor_id"])
+    grouped = _group_players(rows, session_counts, fav_ids=fav_ids)
 
     players = []
     for p, last_raw in rows:
@@ -433,7 +498,7 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         "request": request,
         "flash": pop_flash(request),
         "players": players,
-        "grouped": grouped,
+        "grouped": grouped,   # used by instructor_dashboard.html
     }
     return templates.TemplateResponse("instructor_dashboard.html", ctx)
 
@@ -483,7 +548,6 @@ async def create_player(
     Redirects back to /instructor for HTML accepts; returns JSON otherwise.
     """
     if not request.session.get("instructor_id"):
-        # Respect both HTML and API callers
         if "text/html" in (request.headers.get("accept") or ""):
             set_flash(request, "Please log in as an instructor.")
             return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
@@ -521,7 +585,6 @@ async def create_player(
     db.commit()
     db.refresh(p)
 
-    # HTML form? redirect with flash. Otherwise JSON.
     if "text/html" in (request.headers.get("accept") or ""):
         set_flash(request, f"Player '{p.name}' created. Code: {raw_code}")
         return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
@@ -603,6 +666,34 @@ def assign_drill(
     db.add(a)
     db.commit()
     return JSONResponse({"ok": True})
+
+# --------------- Favorites toggle (fixes POST /favorite/<id> 404) -------------
+@app.post("/favorite/{player_id}")
+def toggle_favorite(player_id: int, request: Request, db: Session = Depends(get_db)):
+    iid = request.session.get("instructor_id")
+    if not iid:
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+    # Toggle: delete if exists, else insert
+    exists = db.execute(
+        text("SELECT 1 FROM favorites WHERE instructor_id = :iid AND player_id = :pid"),
+        {"iid": iid, "pid": player_id}
+    ).first()
+
+    if exists:
+        db.execute(
+            text("DELETE FROM favorites WHERE instructor_id = :iid AND player_id = :pid"),
+            {"iid": iid, "pid": player_id}
+        )
+        db.commit()
+        return JSONResponse({"ok": True, "favorite": False})
+    else:
+        db.execute(
+            text("INSERT INTO favorites (instructor_id, player_id) VALUES (:iid, :pid)"),
+            {"iid": iid, "pid": player_id}
+        )
+        db.commit()
+        return JSONResponse({"ok": True, "favorite": True})
 
 # ------------------------- Health check ---------------------------------------
 @app.get("/healthz")

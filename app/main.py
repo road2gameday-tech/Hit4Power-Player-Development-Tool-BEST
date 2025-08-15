@@ -1,7 +1,7 @@
-# app/routes.py
+# app/main.py
 import os
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from .database import SessionLocal, engine, Base
 from .models import (
-    Player, Instructor, Metric, Note, Drill, DrillAssignment, InstructorFavorite
+    Player, Instructor, Metric, Note, DrillAssignment
 )
 from .utils import (
     normalize_code, hash_code, set_flash, pop_flash, age_bucket
@@ -28,13 +28,21 @@ app = FastAPI()
 
 # Sessions (required for flash + auth)
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-insecure-session-secret")
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax", https_only=False)
+# Set https_only=True in prod (Render terminates TLS at the proxy; downstream is HTTP).
+HTTPS_ONLY = os.getenv("ENV", "dev") != "dev"
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    same_site="lax",
+    https_only=HTTPS_ONLY,
+    session_cookie="h4p_session",
+)
 
 # Static files & templates
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
-# Create tables if they don't exist yet (ok for demo; use Alembic in prod)
+# Create tables if they don't exist (ok for demo; prefer Alembic migrations for prod)
 Base.metadata.create_all(bind=engine)
 
 
@@ -52,65 +60,61 @@ def get_db():
 # ------------------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------------------
-
 def _login_lookup(db: Session, model, raw_code: str):
     """
     Flexible login lookup:
       1) Try normalized plaintext match (if you store normalized codes)
       2) Try hashed match (if you store HMAC of normalized)
-    Works for Player and Instructor since both have .login_code.
     """
     norm = normalize_code(raw_code)
-    # a) plaintext normalized
-    obj = db.execute(
-        select(model).where(model.login_code == norm)
-    ).scalar_one_or_none()
+    obj = db.execute(select(model).where(model.login_code == norm)).scalar_one_or_none()
     if obj:
         return obj
-    # b) hashed
     hashed = hash_code(raw_code)
-    obj = db.execute(
-        select(model).where(model.login_code == hashed)
-    ).scalar_one_or_none()
-    return obj
+    return db.execute(select(model).where(model.login_code == hashed)).scalar_one_or_none()
 
 
 def _latest_metrics_query(player_id: int):
     """
-    Returns a selectable that yields the latest row per (player_id, metric).
+    Select newest row per (player_id, metric). Use for “Latest metrics” on dashboards.
     """
     subq = (
         select(
             Metric.metric.label("metric"),
-            func.max(Metric.recorded_at).label("latest")
+            func.max(Metric.recorded_at).label("latest"),
         )
         .where(Metric.player_id == player_id)
         .group_by(Metric.metric)
         .subquery()
     )
-
-    stmt = (
+    return (
         select(Metric)
         .where(Metric.player_id == player_id)
-        .join(
-            subq,
-            and_(
-                Metric.metric == subq.c.metric,
-                Metric.recorded_at == subq.c.latest,
-            )
-        )
+        .join(subq, and_(Metric.metric == subq.c.metric, Metric.recorded_at == subq.c.latest))
         .order_by(Metric.metric.asc())
     )
-    return stmt
+
+
+def _parse_iso_dt(value: Optional[str]) -> datetime:
+    """
+    Parse ISO8601 timestamps including 'Z' suffix; default to now if empty.
+    """
+    if not value:
+        return datetime.utcnow()
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(v)
+    except Exception:
+        return datetime.utcnow()
 
 
 # ------------------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------------------
-
 @app.get("/")
 def index(request: Request):
-    # Always pass {"request": request} to templates; flash is read-only in templates
     ctx = {"request": request, "flash": pop_flash(request)}
     return templates.TemplateResponse("index.html", ctx)
 
@@ -122,9 +126,7 @@ def login_player(request: Request, code: str = Form(...), db: Session = Depends(
         set_flash(request, "Invalid code. Please try again.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
-    # Auth OK
     request.session["player_id"] = player.id
-    # Clear any instructor session
     request.session.pop("instructor_id", None)
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -150,7 +152,6 @@ def logout(request: Request):
 
 
 # ------------------------- Player dashboard -----------------------------------
-
 @app.get("/dashboard")
 def dashboard(request: Request, db: Session = Depends(get_db)):
     pid = request.session.get("player_id")
@@ -165,7 +166,6 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
     latest_metrics = db.execute(_latest_metrics_query(pid)).scalars().all()
 
-    # Most recent shared note
     last_note = db.execute(
         select(Note)
         .where(Note.player_id == pid, Note.shared == True)  # noqa: E712
@@ -173,7 +173,6 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         .limit(1)
     ).scalar_one_or_none()
 
-    # Active drill assignments
     drills = db.execute(
         select(DrillAssignment)
         .where(DrillAssignment.player_id == pid, DrillAssignment.status != "archived")
@@ -193,7 +192,6 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
 
 # ------------------------- Instructor views -----------------------------------
-
 @app.get("/instructor")
 def instructor_home(request: Request, db: Session = Depends(get_db)):
     iid = request.session.get("instructor_id")
@@ -201,11 +199,10 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         set_flash(request, "Please log in as an instructor.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
-    # Simple roster ordered by most recently updated metric or player update
     last_metric_subq = (
         select(
             Metric.player_id.label("pid"),
-            func.max(Metric.recorded_at).label("last_metric_at")
+            func.max(Metric.recorded_at).label("last_metric_at"),
         )
         .group_by(Metric.player_id)
         .subquery()
@@ -238,7 +235,9 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
         select(Note).where(Note.player_id == player_id).order_by(Note.created_at.desc()).limit(25)
     ).scalars().all()
     assignments = db.execute(
-        select(DrillAssignment).where(DrillAssignment.player_id == player_id).order_by(DrillAssignment.created_at.desc())
+        select(DrillAssignment)
+        .where(DrillAssignment.player_id == player_id)
+        .order_by(DrillAssignment.created_at.desc())
     ).scalars().all()
 
     ctx = {
@@ -253,7 +252,6 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
 
 
 # ------------------------- Instructor actions (writes) -------------------------
-
 @app.post("/instructor/player/{player_id}/metric")
 def add_metric(
     player_id: int,
@@ -271,7 +269,7 @@ def add_metric(
     if not player:
         return JSONResponse({"ok": False, "error": "player_not_found"}, status_code=404)
 
-    when = datetime.fromisoformat(recorded_at) if recorded_at else datetime.utcnow()
+    when = _parse_iso_dt(recorded_at)
 
     m = Metric(
         player_id=player_id,
@@ -335,7 +333,6 @@ def assign_drill(
 
 
 # ------------------------- Health check ---------------------------------------
-
 @app.get("/healthz")
 def healthz():
     return PlainTextResponse("ok")

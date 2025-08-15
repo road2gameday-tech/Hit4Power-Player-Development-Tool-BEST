@@ -43,27 +43,28 @@ Base.metadata.create_all(bind=engine)
 # --- Ensure legacy DB has the columns your models expect ----------------------
 def _ensure_schema():
     insp = inspect(engine)
-    try:
-        instr_cols = {c["name"] for c in insp.get_columns("instructors")}
-    except Exception as e:
-        print(f"[ensure_schema] cannot inspect instructors: {e}")
-        instr_cols = set()
 
-    try:
-        player_cols = {c["name"] for c in insp.get_columns("players")}
-    except Exception as e:
-        print(f"[ensure_schema] cannot inspect players: {e}")
-        player_cols = set()
+    def _cols(table: str) -> set[str]:
+        try:
+            return {c["name"] for c in insp.get_columns(table)}
+        except Exception as e:
+            print(f"[ensure_schema] cannot inspect {table}: {e}")
+            return set()
+
+    instr_cols  = _cols("instructors")
+    player_cols = _cols("players")
+    metric_cols = _cols("metrics")
 
     dialect = engine.dialect.name
-    def _add(tbl: str, ddl: str):
-        # SQLite: no IF NOT EXISTS on ADD COLUMN; we've checked above
+
+    def _add(table: str, ddl: str):
+        # PostgreSQL supports IF NOT EXISTS; SQLite doesn't (we checked columns above)
         stmt = ddl if dialect != "postgresql" else ddl.replace(" ADD COLUMN ", " ADD COLUMN IF NOT EXISTS ")
         with engine.begin() as conn:
             conn.execute(text(stmt))
-        print(f"[ensure_schema] {tbl}: applied -> {ddl}")
+        print(f"[ensure_schema] {table}: applied -> {ddl}")
 
-    # Instructors: add missing columns
+    # Instructors – add missing cols
     if "login_code" not in instr_cols:
         _add("instructors", "ALTER TABLE instructors ADD COLUMN login_code TEXT")
     if "created_at" not in instr_cols:
@@ -71,20 +72,33 @@ def _ensure_schema():
     if "updated_at" not in instr_cols:
         _add("instructors", "ALTER TABLE instructors ADD COLUMN updated_at TEXT")
 
-    # Players: add missing timestamp columns (models likely expect them)
+    # Players – add missing timestamp cols
     if "created_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN created_at TEXT")
     if "updated_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN updated_at TEXT")
 
-    # Backfill NULL timestamps so ORM/date formatting won't choke later
+    # Metrics – add recorded_at (used in queries/order-by)
+    if "recorded_at" not in metric_cols:
+        _add("metrics", "ALTER TABLE metrics ADD COLUMN recorded_at TEXT")
+        # Backfill recorded_at so MAX(recorded_at) works immediately
+        with engine.begin() as conn:
+            if "created_at" in metric_cols:
+                conn.execute(text(
+                    "UPDATE metrics SET recorded_at = COALESCE(recorded_at, created_at, CURRENT_TIMESTAMP)"
+                ))
+            else:
+                conn.execute(text(
+                    "UPDATE metrics SET recorded_at = COALESCE(recorded_at, CURRENT_TIMESTAMP)"
+                ))
+        print("[ensure_schema] metrics: backfilled recorded_at")
+
+    # Backfill NULL timestamps (safety)
     with engine.begin() as conn:
         conn.execute(text("UPDATE instructors SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE instructors SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE players SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE players SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
-
-_ensure_schema()
 
 # ------------------------------------------------------------------------------
 # DB dependency

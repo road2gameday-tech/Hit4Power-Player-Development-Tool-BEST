@@ -1,5 +1,6 @@
 # app/main.py
 import os
+import random
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
@@ -37,7 +38,7 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
-# Create missing TABLES (not columns)
+# Create missing **tables** (not columns)
 Base.metadata.create_all(bind=engine)
 
 # ------------------------------------------------------------------------------
@@ -66,7 +67,6 @@ def _ensure_schema():
     instr_cols = cols("instructors")
     player_cols = cols("players")
     metric_cols = cols("metrics")
-
     dialect = engine.dialect.name
 
     def _add(table: str, ddl: str):
@@ -84,7 +84,15 @@ def _ensure_schema():
     if "updated_at" not in instr_cols:
         _add("instructors", "ALTER TABLE instructors ADD COLUMN updated_at TEXT")
 
-    # Players
+    # Players (ensure columns used by templates / models)
+    if "login_code" not in player_cols:
+        _add("players", "ALTER TABLE players ADD COLUMN login_code TEXT")
+    if "age" not in player_cols:
+        _add("players", "ALTER TABLE players ADD COLUMN age INTEGER")
+    if "phone" not in player_cols:
+        _add("players", "ALTER TABLE players ADD COLUMN phone TEXT")
+    if "image_path" not in player_cols:
+        _add("players", "ALTER TABLE players ADD COLUMN image_path TEXT")
     if "created_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN created_at TEXT")
     if "updated_at" not in player_cols:
@@ -155,10 +163,7 @@ def _login_lookup(db: Session, model, raw_code: str):
         return None
 
 def _latest_metrics_query(player_id: int):
-    """
-    Newest row per (player_id, metric) for dashboard 'Latest metrics'.
-    Prefer recorded_at if present; otherwise fall back to max(id).
-    """
+    """Newest row per (player_id, metric) for dashboard 'Latest metrics'."""
     if _has_column("metrics", "recorded_at"):
         subq = (
             select(Metric.metric.label("metric"), func.max(Metric.recorded_at).label("latest_at"))
@@ -173,7 +178,6 @@ def _latest_metrics_query(player_id: int):
             .order_by(Metric.metric.asc())
         )
 
-    # Fallback when recorded_at doesn't exist (extremely unlikely after _ensure_schema)
     subq = (
         select(Metric.metric.label("metric"), func.max(Metric.id).label("latest_id"))
         .where(Metric.player_id == player_id)
@@ -231,10 +235,7 @@ def _bucket_by_recency(dt: Optional[datetime]) -> str:
     return "Stale (30+ days)"
 
 def _session_counts_by_player(db: Session) -> Dict[int, int]:
-    """
-    Compute number of distinct metric days per player (i.e., 'sessions').
-    Uses recorded_at (added/backfilled in _ensure_schema).
-    """
+    """Count distinct metric days per player."""
     counts: Dict[int, int] = {}
     if not _has_column("metrics", "recorded_at"):
         rows = db.execute(select(Metric.player_id, func.count(Metric.id)).group_by(Metric.player_id)).all()
@@ -283,11 +284,22 @@ def _group_players(rows: List[Tuple[Player, Optional[str]]], session_counts: Dic
         sessions = session_counts.get(p.id, 0)
         is_fav = False  # no favorites field in schema
         pdict = _player_to_dict(p)
-        # IMPORTANT: provide a synthetic "metrics" list so template can call p.metrics|length
+        # Provide a synthetic "metrics" list so template can call p.metrics|length without DB hits
         pdict["metrics"] = [None] * sessions
         grouped.setdefault(bucket, []).append((pdict, sessions, is_fav))
 
     return grouped
+
+def _generate_unique_code(db: Session, length: int = 6) -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # avoid easily confused chars
+    for _ in range(20):
+        code = "".join(random.choice(alphabet) for _ in range(length))
+        norm = normalize_code(code)
+        exists = db.execute(select(Player).where(Player.login_code == norm)).scalar_one_or_none()
+        if not exists:
+            return code
+    # Fallback even if collision loop exhausted
+    return "".join(random.choice(alphabet) for _ in range(length))
 
 # ------------------------------------------------------------------------------
 # Routes
@@ -410,7 +422,6 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
     session_counts = _session_counts_by_player(db)
     grouped = _group_players(rows, session_counts)
 
-    # Keep 'players' (list of dicts) for older templates if they exist
     players = []
     for p, last_raw in rows:
         players.append({
@@ -455,6 +466,68 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
     return templates.TemplateResponse("instructor_player_detail.html", ctx)
 
 # ------------------------- Instructor actions (writes) -------------------------
+
+@app.post("/players/create")
+async def create_player(
+    request: Request,
+    name: Optional[str] = Form(None),
+    age: Optional[int] = Form(None),
+    phone: Optional[str] = Form(None),
+    login_code: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Creates a player.
+    - Works for HTML form posts (Form(...))
+    - Also accepts JSON payloads: {"name": "...", "age": 12, "phone": "...", "login_code": "..."}
+    Redirects back to /instructor for HTML accepts; returns JSON otherwise.
+    """
+    if not request.session.get("instructor_id"):
+        # Respect both HTML and API callers
+        if "text/html" in (request.headers.get("accept") or ""):
+            set_flash(request, "Please log in as an instructor.")
+            return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+
+    # If this wasn't a form submit, try JSON body
+    if name is None:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        name = payload.get("name")
+        age = payload.get("age")
+        phone = payload.get("phone")
+        login_code = payload.get("login_code")
+
+    if not name or not str(name).strip():
+        return JSONResponse({"ok": False, "error": "name_required"}, status_code=400)
+
+    # Determine a login code (normalize provided or generate unique)
+    if login_code and str(login_code).strip():
+        raw_code = str(login_code).strip()
+    else:
+        raw_code = _generate_unique_code(db)
+
+    norm_code = normalize_code(raw_code)
+
+    p = Player(
+        name=str(name).strip(),
+        age=age if (isinstance(age, int) or age is None) else None,
+        phone=(str(phone).strip() or None) if phone is not None else None,
+        login_code=norm_code,
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+
+    # HTML form? redirect with flash. Otherwise JSON.
+    if "text/html" in (request.headers.get("accept") or ""):
+        set_flash(request, f"Player '{p.name}' created. Code: {raw_code}")
+        return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
+
+    return JSONResponse({"ok": True, "player_id": p.id, "login_code": raw_code})
+
 @app.post("/instructor/player/{player_id}/metric")
 def add_metric(
     player_id: int,

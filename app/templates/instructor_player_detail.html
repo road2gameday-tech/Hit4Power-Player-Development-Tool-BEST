@@ -6,8 +6,8 @@
   <div class="player-header card">
     <div class="player-id">
       <div class="avatar">
-        {% if player.avatar_url %}
-          <img src="{{ player.avatar_url }}" alt="{{ player.name }}"/>
+        {% if player.avatar_url or player.image_path %}
+          <img src="{{ player.avatar_url or player.image_path }}" alt="{{ player.name }}"/>
         {% else %}
           <div class="avatar-placeholder">{{ player.name|initials }}</div>
         {% endif %}
@@ -63,14 +63,17 @@
 
       <h3 class="section-title mt-2">Updated Metrics</h3>
       <ul class="list mt-1">
-        {% for m in latest_metrics %}
+        {% for m in latest_metrics or [] %}
           <li>
             <div>
               <strong>{{ m.metric|replace('_',' ')|title }}</strong>:
               {{ (m.value is not none) and ('%.2f'|format(m.value)) or '0.00' }}
               {% if m.unit %} {{ m.unit }}{% endif %}
             </div>
-            <div class="muted">{{ m.recorded_at|datetimeformat("%Y-%m-%d %H:%M") }}{% if m.source %} • {{ m.source }}{% endif %}</div>
+            <div class="muted">
+              {{ m.recorded_at|datetimeformat("%Y-%m-%d %H:%M") }}
+              {% if m.source %} • {{ m.source }}{% endif %}
+            </div>
             {% if m.note %}<div class="muted">“{{ m.note }}”</div>{% endif %}
           </li>
         {% else %}
@@ -85,10 +88,13 @@
     <section class="card">
       <h3 class="section-title">Coach Notes</h3>
       <ul class="list mt-1">
-        {% for n in notes %}
+        {% for n in notes or [] %}
           <li>
             <div class="note-text">{{ n.text }}</div>
-            <div class="note-meta">{{ n.created_at|datetimeformat("%Y-%m-%d %H:%M") }}{% if n.kind %} • {{ n.kind|title }}{% endif %}</div>
+            <div class="note-meta">
+              {{ n.created_at|datetimeformat("%Y-%m-%d %H:%M") }}
+              {% if n.kind %} • {{ n.kind|title }}{% endif %}
+            </div>
           </li>
         {% else %}
           <li class="muted">No notes yet.</li>
@@ -100,7 +106,7 @@
     <section class="card">
       <h3 class="section-title">Assigned Drills</h3>
       <ul class="list mt-1">
-        {% for a in assignments %}
+        {% for a in assignments or [] %}
           <li>
             <div><strong>{{ a.drill_name or "Drill" }}</strong> — {{ a.status or 'assigned' }}</div>
             {% if a.note %}<div class="muted">“{{ a.note }}”</div>{% endif %}
@@ -128,8 +134,9 @@
         try {
           const res = await fetch(`/favorite/${pid}`, { method: 'POST' });
           const j = await res.json();
-          if (j && j.ok) {
-            starBtn.querySelector('.star-shape').classList.toggle('on', !!j.favorite);
+          const fav = (j && (('favorite' in j) ? j.favorite : j.favorited));
+          if (j && (j.ok === true || typeof fav === 'boolean')) {
+            starBtn.querySelector('.star-shape').classList.toggle('on', !!fav);
           }
         } catch (err) {
           console.error(err);
@@ -137,11 +144,12 @@
       });
     })();
 
-    // Exit Velocity Chart
+    // Exit Velocity Chart (defensive against undefined context)
     (function () {
-      const labels = {{ dates|tojson }};
-      const data = {{ exitv|tojson }};
-      if (!labels || labels.length === 0) return;
+      const labels = {{ (dates or [])|tojson }};
+      const data = {{ (exitv or [])|tojson }};
+      if (!Array.isArray(labels) || labels.length === 0) return;
+
       const ensureChartJs = () => new Promise((resolve) => {
         if (window.Chart) return resolve();
         const s = document.createElement('script');
@@ -149,10 +157,11 @@
         s.onload = resolve;
         document.head.appendChild(s);
       });
+
       ensureChartJs().then(() => {
-        const ctx = document.getElementById('evChart');
-        if (!ctx) return;
-        new Chart(ctx, {
+        const el = document.getElementById('evChart');
+        if (!el) return;
+        new Chart(el, {
           type: 'line',
           data: {
             labels: labels,

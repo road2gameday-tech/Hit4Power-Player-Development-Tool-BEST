@@ -6,10 +6,10 @@
   <div class="player-header card">
     <div class="player-id">
       <div class="avatar">
-        {% if player.image_path %}
-          <img src="{{ player.image_path }}" alt="{{ player.name }}"/>
+        {% if player.avatar_url %}
+          <img src="{{ player.avatar_url }}" alt="{{ player.name }}"/>
         {% else %}
-          <div class="avatar-placeholder">{{ player.name[0] }}</div>
+          <div class="avatar-placeholder">{{ player.name|initials }}</div>
         {% endif %}
       </div>
       <div>
@@ -21,79 +21,159 @@
   </div>
 
   <div class="grid two">
+    <!-- Left: Chart -->
     <section class="card">
-      <h3 class="section-title">Add Metrics</h3>
+      <h3 class="section-title">Exit Velocity Trend</h3>
+      {% if dates and dates|length > 0 %}
+        <canvas id="evChart" height="140"></canvas>
+      {% else %}
+        <div class="muted">No exit velocity data yet.</div>
+      {% endif %}
+    </section>
+
+    <!-- Right: Add Metric + Latest Metrics -->
+    <section class="card">
+      <h3 class="section-title">Add Metric</h3>
       <form method="post" action="/metrics/add" class="form">
         <input type="hidden" name="player_id" value="{{ player.id }}"/>
-        <label>Date</label>
-        <input type="date" name="date" value="{{ (namespace(d=cycler).__class__.__name__ and '') or '' }}" />
-        <label>Exit Velocity</label>
-        <input name="exit_velocity" type="number" step="0.1" placeholder="mph" />
-        <label>Launch Angle</label>
-        <input name="launch_angle" type="number" step="0.1" placeholder="deg" />
-        <label>Spin Rate</label>
-        <input name="spin_rate" type="number" step="0.1" placeholder="rpm" />
+
+        <label>Metric</label>
+        <select name="metric" required>
+          <option value="exit_velocity">Exit Velocity</option>
+          <option value="launch_angle">Launch Angle</option>
+          <option value="spin_rate">Spin Rate</option>
+        </select>
+
+        <label>Value</label>
+        <input name="value" type="number" step="0.01" placeholder="Enter a number" required />
+
+        <label>Unit</label>
+        <input name="unit" list="unitOptions" placeholder="e.g., mph / deg / rpm" />
+        <datalist id="unitOptions">
+          <option value="mph"></option>
+          <option value="deg"></option>
+          <option value="rpm"></option>
+        </datalist>
+
+        <label>Note (optional)</label>
+        <input name="note" placeholder="Context for this measurement" />
+
         <button class="btn btn-red">Save</button>
       </form>
+
+      <h3 class="section-title mt-2">Updated Metrics</h3>
       <ul class="list mt-1">
-        {% for m in metrics %}
-          <li>{{ m.date|datetimeformat }} — EV: {{ m.exit_velocity or 0 }}, LA: {{ m.launch_angle or 0 }}, SR: {{ m.spin_rate or 0 }}</li>
+        {% for m in latest_metrics %}
+          <li>
+            <div>
+              <strong>{{ m.metric|replace('_',' ')|title }}</strong>:
+              {{ (m.value is not none) and ('%.2f'|format(m.value)) or '0.00' }}
+              {% if m.unit %} {{ m.unit }}{% endif %}
+            </div>
+            <div class="muted">{{ m.recorded_at|datetimeformat("%Y-%m-%d %H:%M") }}{% if m.source %} • {{ m.source }}{% endif %}</div>
+            {% if m.note %}<div class="muted">“{{ m.note }}”</div>{% endif %}
+          </li>
         {% else %}
-          <li class="muted">No metrics yet.</li>
+          <li class="muted">No metrics recorded yet.</li>
         {% endfor %}
       </ul>
     </section>
+  </div>
 
+  <div class="grid two">
+    <!-- Coach Notes (read-only list) -->
     <section class="card">
       <h3 class="section-title">Coach Notes</h3>
-      <form method="post" action="/notes/add" class="form flex-row">
-        <input type="hidden" name="player_id" value="{{ player.id }}"/>
-        <textarea name="text" rows="2" placeholder="Write a private note to this player" required></textarea>
-        <div class="checks">
-          <label class="check"><input type="checkbox" name="share_with_player"> <span>Share on player dashboard</span></label>
-          <label class="check"><input type="checkbox" name="text_player"> <span>Text player</span></label>
-        </div>
-        <button class="btn btn-red">Add</button>
-      </form>
       <ul class="list mt-1">
         {% for n in notes %}
           <li>
             <div class="note-text">{{ n.text }}</div>
-            <div class="note-meta">{{ n.created_at|datetimeformat }}{% if n.shared %} • <span class="a-red">Shared</span>{% endif %}</div>
+            <div class="note-meta">{{ n.created_at|datetimeformat("%Y-%m-%d %H:%M") }}{% if n.kind %} • {{ n.kind|title }}{% endif %}</div>
           </li>
         {% else %}
           <li class="muted">No notes yet.</li>
         {% endfor %}
       </ul>
     </section>
+
+    <!-- Assigned Drills (read-only list) -->
+    <section class="card">
+      <h3 class="section-title">Assigned Drills</h3>
+      <ul class="list mt-1">
+        {% for a in assignments %}
+          <li>
+            <div><strong>{{ a.drill_name or "Drill" }}</strong> — {{ a.status or 'assigned' }}</div>
+            {% if a.note %}<div class="muted">“{{ a.note }}”</div>{% endif %}
+            <div class="muted">
+              Assigned: {{ a.created_at|datetimeformat("%Y-%m-%d") }}
+              {% if a.due_date %} • Due: {{ a.due_date|datetimeformat("%Y-%m-%d") }}{% endif %}
+            </div>
+          </li>
+        {% else %}
+          <li class="muted">No assigned drills yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
   </div>
 
-  <section class="card">
-    <h3 class="section-title">Assign a Drill</h3>
-    <form method="post" action="/drills/assign" class="form row">
-      <input type="hidden" name="player_id" value="{{ player.id }}"/>
-      <select name="drill_id" required>
-        <option value="" disabled selected>Select a drill</option>
-        {% for d in drills %}
-          <option value="{{ d.id }}">{{ d.title }}</option>
-        {% endfor %}
-      </select>
-      <input name="note" placeholder="Optional note"/>
-      <button class="btn btn-red">Assign</button>
-    </form>
-  </section>
-
+  <!-- Scripts -->
   <script>
-    // star button on detail
-    const starBtn = document.querySelector('.player-header .star');
-    if (starBtn) {
+    // Star toggle
+    (function () {
+      const starBtn = document.querySelector('.player-header .star');
+      if (!starBtn) return;
       starBtn.addEventListener('click', async (e) => {
         e.preventDefault();
         const pid = starBtn.dataset.player;
-        const res = await fetch(`/favorite/${pid}`, { method: 'POST' });
-        const j = await res.json().catch(()=>({}));
-        starBtn.querySelector('.star-shape').classList.toggle('on', j && j.favorited);
+        try {
+          const res = await fetch(`/favorite/${pid}`, { method: 'POST' });
+          const j = await res.json();
+          if (j && j.ok) {
+            starBtn.querySelector('.star-shape').classList.toggle('on', !!j.favorite);
+          }
+        } catch (err) {
+          console.error(err);
+        }
       });
-    }
+    })();
+
+    // Exit Velocity Chart
+    (function () {
+      const labels = {{ dates|tojson }};
+      const data = {{ exitv|tojson }};
+      if (!labels || labels.length === 0) return;
+      const ensureChartJs = () => new Promise((resolve) => {
+        if (window.Chart) return resolve();
+        const s = document.createElement('script');
+        s.src = "https://cdn.jsdelivr.net/npm/chart.js";
+        s.onload = resolve;
+        document.head.appendChild(s);
+      });
+      ensureChartJs().then(() => {
+        const ctx = document.getElementById('evChart');
+        if (!ctx) return;
+        new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [{
+              label: 'Exit Velocity (mph)',
+              data: data,
+              fill: false,
+              tension: 0.25
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              x: { ticks: { autoSkip: true, maxTicksLimit: 6 } },
+              y: { beginAtZero: true }
+            },
+            plugins: { legend: { display: true } }
+          }
+        });
+      });
+    })();
   </script>
 {% endblock %}

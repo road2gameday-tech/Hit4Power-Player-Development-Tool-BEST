@@ -13,6 +13,16 @@ from starlette import status
 from sqlalchemy import func, select, and_, inspect, text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy import inspect
+
+def _has_column(table: str, col: str) -> bool:
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns(table)}
+        return col in cols
+    except Exception as e:
+        print(f"[has_column] cannot inspect {table}: {e}")
+        return False
+
 
 from .database import SessionLocal, engine, Base
 from .models import Player, Instructor, Metric, Note, DrillAssignment
@@ -44,27 +54,27 @@ Base.metadata.create_all(bind=engine)
 def _ensure_schema():
     insp = inspect(engine)
 
-    def _cols(table: str) -> set[str]:
+    def cols(table: str) -> set[str]:
         try:
             return {c["name"] for c in insp.get_columns(table)}
         except Exception as e:
             print(f"[ensure_schema] cannot inspect {table}: {e}")
             return set()
 
-    instr_cols  = _cols("instructors")
-    player_cols = _cols("players")
-    metric_cols = _cols("metrics")
+    instr_cols  = cols("instructors")
+    player_cols = cols("players")
+    metric_cols = cols("metrics")
 
     dialect = engine.dialect.name
 
     def _add(table: str, ddl: str):
-        # PostgreSQL supports IF NOT EXISTS; SQLite doesn't (we checked columns above)
+        # PG supports IF NOT EXISTS; SQLite doesn’t (we checked columns above)
         stmt = ddl if dialect != "postgresql" else ddl.replace(" ADD COLUMN ", " ADD COLUMN IF NOT EXISTS ")
         with engine.begin() as conn:
             conn.execute(text(stmt))
         print(f"[ensure_schema] {table}: applied -> {ddl}")
 
-    # Instructors – add missing cols
+    # Instructors
     if "login_code" not in instr_cols:
         _add("instructors", "ALTER TABLE instructors ADD COLUMN login_code TEXT")
     if "created_at" not in instr_cols:
@@ -72,16 +82,15 @@ def _ensure_schema():
     if "updated_at" not in instr_cols:
         _add("instructors", "ALTER TABLE instructors ADD COLUMN updated_at TEXT")
 
-    # Players – add missing timestamp cols
+    # Players
     if "created_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN created_at TEXT")
     if "updated_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN updated_at TEXT")
 
-    # Metrics – add recorded_at (used in queries/order-by)
+    # Metrics — add and backfill recorded_at (the cause of your current 500)
     if "recorded_at" not in metric_cols:
         _add("metrics", "ALTER TABLE metrics ADD COLUMN recorded_at TEXT")
-        # Backfill recorded_at so MAX(recorded_at) works immediately
         with engine.begin() as conn:
             if "created_at" in metric_cols:
                 conn.execute(text(
@@ -93,12 +102,13 @@ def _ensure_schema():
                 ))
         print("[ensure_schema] metrics: backfilled recorded_at")
 
-    # Backfill NULL timestamps (safety)
+    # Safety backfill for timestamps (idempotent)
     with engine.begin() as conn:
         conn.execute(text("UPDATE instructors SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE instructors SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE players SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE players SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+
 
 # ------------------------------------------------------------------------------
 # DB dependency
@@ -246,18 +256,26 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         set_flash(request, "Please log in as an instructor.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
+    # Decide which timestamp column to use for "last metric"
+    use_recorded = _has_column("metrics", "recorded_at")
+    time_col = Metric.recorded_at if use_recorded else Metric.created_at
+
     last_metric_subq = (
-        select(Metric.player_id.label("pid"), func.max(Metric.recorded_at).label("last_metric_at"))
+        select(
+            Metric.player_id.label("pid"),
+            func.max(time_col).label("last_metric_at"),
+        )
         .group_by(Metric.player_id)
         .subquery()
     )
 
-    # Coalesce NULLs to an old date for SQLite-friendly sort (no NULLS LAST support)
     rows = db.execute(
         select(Player, last_metric_subq.c.last_metric_at)
         .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
+        # SQLite has no NULLS LAST; coalesce to an old date so NULLs sort last
         .order_by(func.coalesce(last_metric_subq.c.last_metric_at, text("'1970-01-01 00:00:00'")).desc(), Player.id.desc())
     ).all()
+
 
     players = [{"player": r[0], "last_update": r[1]} for r in rows]
     ctx = {"request": request, "flash": pop_flash(request), "players": players}

@@ -1,25 +1,84 @@
 {% extends "base.html" %}
-{% set title = "Login" %}
+{% set title = "Sign In" %}
 {% block content %}
   <div class="grid two">
+
+    <!-- Player Login -->
     <section class="card">
       <h2>Player Login</h2>
-      <form method="post" action="/login/player" class="form">
-        <label>Login Code</label>
-        <input name="code" required placeholder="P-XXXXXX" />
-        <button class="btn btn-red" type="submit">Login</button>
+
+      {% if error or player_error %}
+        <div class="error" role="alert">
+          {{ player_error or error }}
+        </div>
+      {% endif %}
+
+      <form class="form" method="post" action="/login/player" autocomplete="on">
+        {# Optional CSRF token if you provide it from the server #}
+        {% if csrf_token %}
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% endif %}
+
+        <label for="player-code">Login Code</label>
+        <input
+          id="player-code"
+          name="code"
+          type="password"
+          required
+          placeholder="P-XXXXXX"
+          inputmode="text"
+          autocomplete="one-time-code"
+          autocapitalize="off"
+          spellcheck="false"
+          maxlength="32"
+          pattern="[A-Za-z0-9\-]{4,32}"
+          aria-describedby="player-code-help"
+        />
+        <small id="player-code-help" class="muted small">
+          Enter the code your coach gave you. (Letters & numbers only; dashes OK.)
+        </small>
+
+        <button class="btn btn-red" type="submit" enterkeyhint="go">Login</button>
       </form>
-      {% if error %}<div class="error">{{ error }}</div>{% endif %}
     </section>
 
+    <!-- Instructor Login -->
     <section class="card">
       <h2>Instructor Login</h2>
-      <form method="post" action="/login/instructor" class="form">
-        <label>Instructor Code</label>
-        <input name="code" required placeholder="Your code" />
-        <button class="btn btn-red" type="submit">Login</button>
+
+      {% if instructor_error %}
+        <div class="error" role="alert">
+          {{ instructor_error }}
+        </div>
+      {% endif %}
+
+      <form class="form" method="post" action="/login/instructor" autocomplete="on">
+        {% if csrf_token %}
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% endif %}
+
+        <label for="instructor-code">Instructor Code</label>
+        <input
+          id="instructor-code"
+          name="code"
+          type="password"
+          required
+          placeholder="Your code"
+          inputmode="text"
+          autocomplete="one-time-code"
+          autocapitalize="off"
+          spellcheck="false"
+          maxlength="32"
+          pattern="[A-Za-z0-9\-]{4,32}"
+        />
+
+        <button class="btn btn-red" type="submit" enterkeyhint="go">Login</button>
       </form>
-      <p class="mt-1 small muted">Default code is set by env var <code>INSTRUCTOR_DEFAULT_CODE</code>.</p>
+
+      <p class="mt-1 small muted">
+        Trouble logging in? Contact the site admin to reset your code.
+      </p>
     </section>
+
   </div>
 {% endblock %}

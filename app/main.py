@@ -1,8 +1,7 @@
 # app/main.py
 import os
-import random
-from datetime import datetime
-from typing import Optional, Dict, List, Tuple, Set
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Tuple, Any
 
 from fastapi import FastAPI, Request, Depends, Form, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
@@ -18,57 +17,6 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from .database import SessionLocal, engine, Base
 from .models import Player, Instructor, Metric, Note, DrillAssignment
 from .utils import normalize_code, hash_code, set_flash, pop_flash, age_bucket
-
-from collections import defaultdict
-from datetime import datetime
-
-def _chart_series(db: Session, player_id: int):
-    """
-    Build simple timeseries for common hitting metrics.
-    Returns (dates[], ev[], la[], sr[]), where dates are 'YYYY-MM-DD' strings.
-    Missing metrics -> empty lists.
-    """
-    rows = db.execute(
-        select(Metric)
-        .where(Metric.player_id == player_id)
-        .order_by(Metric.recorded_at.asc())
-    ).scalars().all()
-
-    if not rows:
-        return [], [], [], []
-
-    # Collect unique day labels in order
-    def _day(v):
-        if isinstance(v, datetime):
-            return v.date().isoformat()
-        # strings like "2025-01-05 12:34" or "2025-01-05"
-        s = str(v).strip()
-        return s[:10] if len(s) >= 10 else s
-
-    labels = []
-    seen = set()
-    for r in rows:
-        d = _day(r.recorded_at)
-        if d not in seen:
-            labels.append(d)
-            seen.add(d)
-
-    # Map date -> value for each metric we care about
-    wanted = {
-        "exit_velocity": defaultdict(lambda: None),
-        "launch_angle": defaultdict(lambda: None),
-        "spin_rate": defaultdict(lambda: None),
-    }
-    for r in rows:
-        m = (r.metric or "").strip().lower()
-        if m in wanted:
-            wanted[m][_day(r.recorded_at)] = r.value
-
-    ev = [wanted["exit_velocity"][d] for d in labels]
-    la = [wanted["launch_angle"][d] for d in labels]
-    sr = [wanted["spin_rate"][d] for d in labels]
-    return labels, ev, la, sr
-
 
 # ------------------------------------------------------------------------------
 # App setup
@@ -89,58 +37,36 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
-from datetime import datetime, timezone
-
-def _parse_any_dt(v):
+# Jinja helpers ----------------------------------------------------------------
+def _to_dt(v: Any) -> Optional[datetime]:
     if v is None:
         return None
     if isinstance(v, datetime):
         return v
     s = str(v).strip()
-    if not s:
-        return None
-    # support trailing Z
     if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
+        s = s.replace("Z", "+00:00")
     try:
         return datetime.fromisoformat(s)
     except Exception:
-        # last-ditch common format
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(s, fmt)
-            except Exception:
-                pass
-    return None
+        return None
 
-def _datetimeformat_filter(value, fmt="%b %d, %Y"):
-    dt = _parse_any_dt(value)
-    return dt.strftime(fmt) if dt else ""
-
-def _ago_filter(value):
-    dt = _parse_any_dt(value)
+def datetimeformat(value: Any, fmt: str = "%b %d, %Y %I:%M%p"):
+    dt = _to_dt(value)
     if not dt:
         return ""
-    now = datetime.now(dt.tzinfo or timezone.utc) if dt.tzinfo else datetime.utcnow()
-    seconds = int((now - dt).total_seconds())
-    for name, secs in (("year", 31536000), ("month", 2592000), ("week", 604800),
-                       ("day", 86400), ("hour", 3600), ("minute", 60)):
-        n = seconds // secs
-        if n >= 1:
-            return f"{n} {name}{'' if n == 1 else 's'} ago"
-    return "just now"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime(fmt)
 
-# Register filters for all templates
-templates.env.filters["datetimeformat"] = _datetimeformat_filter
-templates.env.filters["ago"] = _ago_filter
+templates.env.filters["datetimeformat"] = datetimeformat  # template uses this
 
-
+# ------------------------------------------------------------------------------
 # Create missing **tables** (not columns)
+# ------------------------------------------------------------------------------
 Base.metadata.create_all(bind=engine)
 
-# ------------------------------------------------------------------------------
-# Schema helpers / patching
-# ------------------------------------------------------------------------------
+# --- schema helpers -----------------------------------------------------------
 def _has_column(table: str, col: str) -> bool:
     try:
         cols = {c["name"] for c in inspect(engine).get_columns(table)}
@@ -149,15 +75,7 @@ def _has_column(table: str, col: str) -> bool:
         print(f"[has_column] cannot inspect {table}: {e}")
         return False
 
-def _has_table(table: str) -> bool:
-    try:
-        return inspect(engine).has_table(table)
-    except Exception as e:
-        print(f"[has_table] cannot inspect {table}: {e}")
-        return False
-
 def _ensure_schema():
-    """Add legacy columns if missing (idempotent) and backfill needed data."""
     insp = inspect(engine)
 
     def cols(table: str) -> set[str]:
@@ -167,16 +85,16 @@ def _ensure_schema():
             print(f"[ensure_schema] cannot inspect {table}: {e}")
             return set()
 
-    instr_cols = cols("instructors")
+    instr_cols  = cols("instructors")
     player_cols = cols("players")
     metric_cols = cols("metrics")
-    notes_cols  = cols("notes")
-    drills_cols = cols("drill_assignments")
+    note_cols   = cols("notes")
+    drill_cols  = cols("drill_assignments")
 
     dialect = engine.dialect.name
 
     def _add(table: str, ddl: str):
-        # Postgres supports IF NOT EXISTS; SQLite doesn't (we guard via cols())
+        # PG supports IF NOT EXISTS; SQLite doesn’t (we checked columns above)
         stmt = ddl if dialect != "postgresql" else ddl.replace(" ADD COLUMN ", " ADD COLUMN IF NOT EXISTS ")
         with engine.begin() as conn:
             conn.execute(text(stmt))
@@ -190,22 +108,18 @@ def _ensure_schema():
     if "updated_at" not in instr_cols:
         _add("instructors", "ALTER TABLE instructors ADD COLUMN updated_at TEXT")
 
-    # Players (ensure columns used by templates / models)
-    if "login_code" not in player_cols:
-        _add("players", "ALTER TABLE players ADD COLUMN login_code TEXT")
-    if "age" not in player_cols:
-        _add("players", "ALTER TABLE players ADD COLUMN age INTEGER")
-    if "phone" not in player_cols:
-        _add("players", "ALTER TABLE players ADD COLUMN phone TEXT")
-    if "image_path" not in player_cols:
-        _add("players", "ALTER TABLE players ADD COLUMN image_path TEXT")
+    # Players
     if "created_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN created_at TEXT")
     if "updated_at" not in player_cols:
         _add("players", "ALTER TABLE players ADD COLUMN updated_at TEXT")
 
-    # Metrics — ensure the full set of columns your models/templates expect
-    expected_metrics_cols = [
+    # Optional favorite flag (used by /favorite route & dashboard stars)
+    if "favorite" not in player_cols:
+        _add("players", "ALTER TABLE players ADD COLUMN favorite INTEGER")
+
+    # Metrics — many legacy DBs are missing these columns
+    needed_metric_cols = [
         ("metric", "TEXT"),
         ("value", "REAL"),
         ("unit", "TEXT"),
@@ -214,15 +128,31 @@ def _ensure_schema():
         ("entered_by_instructor_id", "INTEGER"),
         ("note", "TEXT"),
     ]
-    for name, typ in expected_metrics_cols:
+    for name, typ in needed_metric_cols:
         if name not in metric_cols:
             _add("metrics", f"ALTER TABLE metrics ADD COLUMN {name} {typ}")
 
-    # Backfill recorded_at from created_at if present; else current time
-    metric_cols_after = cols("metrics")
-    if "recorded_at" in metric_cols_after:
-        with engine.begin() as conn:
-            if "created_at" in metric_cols_after:
+    # Notes
+    if "kind" not in note_cols:
+        _add("notes", "ALTER TABLE notes ADD COLUMN kind TEXT")
+    if "created_at" not in note_cols:
+        _add("notes", "ALTER TABLE notes ADD COLUMN created_at TEXT")
+    if "updated_at" not in note_cols:
+        _add("notes", "ALTER TABLE notes ADD COLUMN updated_at TEXT")
+
+    # Drill assignments
+    if "due_date" not in drill_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN due_date TEXT")
+    if "created_at" not in drill_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN created_at TEXT")
+    if "updated_at" not in drill_cols:
+        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN updated_at TEXT")
+
+    # Backfills / safety idempotent updates
+    with engine.begin() as conn:
+        # recorded_at backfill for metrics
+        if "recorded_at" in {c for c, _ in needed_metric_cols}:
+            if "created_at" in metric_cols:
                 conn.execute(text(
                     "UPDATE metrics SET recorded_at = COALESCE(recorded_at, created_at, CURRENT_TIMESTAMP)"
                 ))
@@ -230,64 +160,19 @@ def _ensure_schema():
                 conn.execute(text(
                     "UPDATE metrics SET recorded_at = COALESCE(recorded_at, CURRENT_TIMESTAMP)"
                 ))
-        print("[ensure_schema] metrics: backfilled recorded_at")
+            print("[ensure_schema] metrics: backfilled recorded_at")
 
-    # Notes — ensure kind/shared/timestamps exist so dashboard query won't 500
-    if "kind" not in notes_cols:
-        _add("notes", "ALTER TABLE notes ADD COLUMN kind TEXT")
-    if "shared" not in notes_cols:
-        _add("notes", "ALTER TABLE notes ADD COLUMN shared INTEGER")
-    if "created_at" not in notes_cols:
-        _add("notes", "ALTER TABLE notes ADD COLUMN created_at TEXT")
-    if "updated_at" not in notes_cols:
-        _add("notes", "ALTER TABLE notes ADD COLUMN updated_at TEXT")
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE notes SET shared = COALESCE(shared, 1)"))
-        conn.execute(text("UPDATE notes SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
-        conn.execute(text("UPDATE notes SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
-
-    # Drill assignments — make sure fields used in queries exist
-    drills_cols = cols("drill_assignments")
-    if "status" not in drills_cols:
-        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN status TEXT")
-    if "note" not in drills_cols:
-        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN note TEXT")
-    if "due_date" not in drills_cols:
-        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN due_date TEXT")
-    if "created_at" not in drills_cols:
-        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN created_at TEXT")
-    if "updated_at" not in drills_cols:
-        _add("drill_assignments", "ALTER TABLE drill_assignments ADD COLUMN updated_at TEXT")
-
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE drill_assignments SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
-        conn.execute(text("UPDATE drill_assignments SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
-        conn.execute(text("UPDATE drill_assignments SET status = COALESCE(status, 'assigned')"))
-
-
-    # Favorites mapping table (instructor <-> player)
-    if not _has_table("favorites"):
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE favorites (
-                    instructor_id INTEGER NOT NULL,
-                    player_id INTEGER NOT NULL,
-                    PRIMARY KEY (instructor_id, player_id)
-                )
-            """))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_favorites_instructor ON favorites (instructor_id)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_favorites_player ON favorites (player_id)"))
-        print("[ensure_schema] created favorites table")
-
-    # Safety backfill for timestamps (idempotent)
-    with engine.begin() as conn:
+        # created/updated timestamps for other tables
         conn.execute(text("UPDATE instructors SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE instructors SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE players SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
         conn.execute(text("UPDATE players SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE notes SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE notes SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE drill_assignments SET created_at = COALESCE(created_at, CURRENT_TIMESTAMP)"))
+        conn.execute(text("UPDATE drill_assignments SET updated_at = COALESCE(updated_at, CURRENT_TIMESTAMP)"))
 
-# Run schema patch once at import time (service startup)
-_ensure_schema()
+_ensure_schema()  # run at import time
 
 # ------------------------------------------------------------------------------
 # DB dependency
@@ -317,22 +202,9 @@ def _login_lookup(db: Session, model, raw_code: str):
 
 def _latest_metrics_query(player_id: int):
     """Newest row per (player_id, metric) for dashboard 'Latest metrics'."""
-    if _has_column("metrics", "recorded_at"):
-        subq = (
-            select(Metric.metric.label("metric"), func.max(Metric.recorded_at).label("latest_at"))
-            .where(Metric.player_id == player_id)
-            .group_by(Metric.metric)
-            .subquery()
-        )
-        return (
-            select(Metric)
-            .where(Metric.player_id == player_id)
-            .join(subq, and_(Metric.metric == subq.c.metric, Metric.recorded_at == subq.c.latest_at))
-            .order_by(Metric.metric.asc())
-        )
-
+    # If recorded_at is missing for some legacy rows, we already backfilled in _ensure_schema
     subq = (
-        select(Metric.metric.label("metric"), func.max(Metric.id).label("latest_id"))
+        select(Metric.metric.label("metric"), func.max(Metric.recorded_at).label("latest"))
         .where(Metric.player_id == player_id)
         .group_by(Metric.metric)
         .subquery()
@@ -340,7 +212,7 @@ def _latest_metrics_query(player_id: int):
     return (
         select(Metric)
         .where(Metric.player_id == player_id)
-        .join(subq, and_(Metric.metric == subq.c.metric, Metric.id == subq.c.latest_id))
+        .join(subq, and_(Metric.metric == subq.c.metric, Metric.recorded_at == subq.c.latest))
         .order_by(Metric.metric.asc())
     )
 
@@ -356,115 +228,55 @@ def _parse_iso_dt(value: Optional[str]) -> datetime:
     except Exception:
         return datetime.utcnow()
 
-def _parse_dt_from_db(val: Optional[str]) -> Optional[datetime]:
-    """Parse DB timestamp-ish strings into datetime (lenient)."""
-    if not val:
-        return None
-    if isinstance(val, datetime):
-        return val
-    s = str(val).strip()
-    try:
-        if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
-        return datetime.fromisoformat(s)
-    except Exception:
-        pass
-    try:
-        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return None
-
-def _bucket_by_recency(dt: Optional[datetime]) -> str:
-    if not dt:
-        return "No data yet"
-    now = datetime.utcnow()
-    days = (now - dt).days
-    if days <= 0:
-        return "Updated today"
-    if days <= 7:
-        return "Updated this week"
-    if days <= 30:
-        return "Updated this month"
-    return "Stale (30+ days)"
-
-def _session_counts_by_player(db: Session) -> Dict[int, int]:
-    """Count distinct metric days per player."""
-    counts: Dict[int, int] = {}
-    if not _has_column("metrics", "recorded_at"):
-        rows = db.execute(select(Metric.player_id, func.count(Metric.id)).group_by(Metric.player_id)).all()
-        for pid, c in rows:
-            counts[int(pid)] = int(c)
-        return counts
-
-    rows = db.execute(
-        select(
-            Metric.player_id,
-            func.count(func.distinct(func.date(Metric.recorded_at)))
-        ).group_by(Metric.player_id)
-    ).all()
-    for pid, c in rows:
-        counts[int(pid)] = int(c)
-    return counts
-
-def _player_to_dict(p: Player) -> Dict[str, Optional[str]]:
-    """Convert ORM Player to a dict so Jinja dot access avoids ORM lazy-loads."""
-    return {
-        "id": p.id,
-        "name": p.name,
-        "age": p.age,
-        "login_code": getattr(p, "login_code", None),
-        "phone": getattr(p, "phone", None),
-        "image_path": getattr(p, "image_path", None),
-        "created_at": getattr(p, "created_at", None),
-        "updated_at": getattr(p, "updated_at", None),
-    }
-
-def _get_favorites(db: Session, instructor_id: int) -> Set[int]:
-    rows = db.execute(
-        text("SELECT player_id FROM favorites WHERE instructor_id = :iid"),
-        {"iid": instructor_id}
-    ).all()
-    return {int(r[0]) for r in rows}
-
-def _group_players(
-    rows: List[Tuple[Player, Optional[str]]],
-    session_counts: Dict[int, int],
-    fav_ids: Optional[Set[int]] = None
-) -> Dict[str, List[Tuple[dict, int, bool]]]:
+def _chart_series(db: Session, player_id: int) -> Tuple[List[str], List[Optional[float]], List[Optional[float]], List[Optional[float]]]:
     """
-    rows: sequence of (Player, last_metric_at)
-    returns: dict bucket -> list of (player_dict_with_fake_metrics, sessions_int, is_fav_bool)
+    Build simple aligned series for the last ~30 records of exit velocity (labels),
+    plus same-index launch angle and spin rate values when present. Missing values -> None.
     """
-    grouped: Dict[str, List[Tuple[dict, int, bool]]] = {}
-    parsed: List[Tuple[Player, Optional[datetime]]] = []
+    # base series by exit velocity (labels)
+    ev_rows = db.execute(
+        select(Metric.recorded_at, Metric.value)
+        .where(Metric.player_id == player_id, Metric.metric == "exit_velocity")
+        .order_by(Metric.recorded_at.asc())
+        .limit(30)
+    ).all()
 
-    for p, last_raw in rows:
-        last_dt = _parse_dt_from_db(last_raw)
-        parsed.append((p, last_dt))
-    parsed.sort(key=lambda x: ((x[1] or datetime(1970, 1, 1)), x[0].id), reverse=True)
+    labels = []
+    ev_values: List[Optional[float]] = []
+    for r in ev_rows:
+        dt = _to_dt(r[0])
+        labels.append(dt.strftime("%Y-%m-%d") if dt else "")
+        ev_values.append(r[1])
 
-    fav_ids = fav_ids or set()
+    # Build a lookup by date for LA and SR
+    la_map: Dict[str, float] = {}
+    sr_map: Dict[str, float] = {}
 
-    for p, last_dt in parsed:
-        bucket = _bucket_by_recency(last_dt)
-        sessions = session_counts.get(p.id, 0)
-        is_fav = p.id in fav_ids
-        pdict = _player_to_dict(p)
-        # Provide a synthetic "metrics" list so template can call p.metrics|length without DB hits
-        pdict["metrics"] = [None] * sessions
-        grouped.setdefault(bucket, []).append((pdict, sessions, is_fav))
+    la_rows = db.execute(
+        select(Metric.recorded_at, Metric.value)
+        .where(Metric.player_id == player_id, Metric.metric == "launch_angle")
+        .order_by(Metric.recorded_at.asc())
+        .limit(60)
+    ).all()
+    for r in la_rows:
+        dt = _to_dt(r[0])
+        key = dt.strftime("%Y-%m-%d") if dt else ""
+        la_map[key] = r[1]
 
-    return grouped
+    sr_rows = db.execute(
+        select(Metric.recorded_at, Metric.value)
+        .where(Metric.player_id == player_id, Metric.metric == "spin_rate")
+        .order_by(Metric.recorded_at.asc())
+        .limit(60)
+    ).all()
+    for r in sr_rows:
+        dt = _to_dt(r[0])
+        key = dt.strftime("%Y-%m-%d") if dt else ""
+        sr_map[key] = r[1]
 
-def _generate_unique_code(db: Session, length: int = 6) -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # avoid easily confused chars
-    for _ in range(20):
-        code = "".join(random.choice(alphabet) for _ in range(length))
-        norm = normalize_code(code)
-        exists = db.execute(select(Player).where(Player.login_code == norm)).scalar_one_or_none()
-        if not exists:
-            return code
-    return "".join(random.choice(alphabet) for _ in range(length))
+    la_values = [la_map.get(d) for d in labels]
+    sr_values = [sr_map.get(d) for d in labels]
+    return labels, ev_values, la_values, sr_values
 
 # ------------------------------------------------------------------------------
 # Routes
@@ -486,13 +298,14 @@ def login_player(request: Request, code: str = Form(...), db: Session = Depends(
 
 @app.post("/login/instructor")
 def login_instructor(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
-    # Try DB first
+    # First try DB
     coach = _login_lookup(db, Instructor, code)
 
     # Fallback to env var (INSTRUCTOR_DEFAULT_CODE)
     if not coach:
         env_code = os.getenv("INSTRUCTOR_DEFAULT_CODE", "")
         if env_code and normalize_code(code) == normalize_code(env_code):
+            # find-or-create a default instructor; persist the normalized code so future logins hit DB path
             coach = db.execute(select(Instructor).order_by(Instructor.id.asc())).scalar_one_or_none()
             if not coach:
                 coach = Instructor(name="Default Instructor", login_code=normalize_code(env_code))
@@ -532,71 +345,67 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
     latest_metrics = db.execute(_latest_metrics_query(pid)).scalars().all()
     last_note = db.execute(
-        select(Note)
-        .where(Note.player_id == pid, Note.shared == True)  # noqa: E712
-        .order_by(Note.created_at.desc())
-        .limit(1)
+        select(Note).where(Note.player_id == pid, Note.shared == True).order_by(Note.created_at.desc()).limit(1)
     ).scalar_one_or_none()
     drills = db.execute(
         select(DrillAssignment)
         .where(DrillAssignment.player_id == pid, DrillAssignment.status != "archived")
         .order_by(DrillAssignment.created_at.desc())
     ).scalars().all()
-    
-# --- chart data so Jinja |tojson never sees Undefined
-dates, ev_series, la_series, sr_series = _chart_series(db, pid)
 
-# Normalize Nones in series to 0s (optional but helps chart libs)
-ev_series = [(v if v is not None else 0) for v in ev_series]
-la_series = [(v if v is not None else 0) for v in la_series]
-sr_series = [(v if v is not None else 0) for v in sr_series]
+    # --- chart data so Jinja |tojson never sees Undefined
+    dates, ev_series, la_series, sr_series = _chart_series(db, pid)
 
-# Provide MANY aliases so any template key works
-chart_ctx = {
-    # labels
-    "dates": dates,
-    "labels": dates,
+    # Normalize Nones in series to 0s (optional but helps chart libs)
+    ev_series = [(v if v is not None else 0) for v in ev_series]
+    la_series = [(v if v is not None else 0) for v in la_series]
+    sr_series = [(v if v is not None else 0) for v in sr_series]
 
-    # exit velocity (template asks for "exitv")
-    "exitv": ev_series,              # <— the one your template expects
-    "ev": ev_series,
-    "ev_series": ev_series,
-    "ev_values": ev_series,
-    "exit_velocity": ev_series,
-    "exit_velocity_values": ev_series,
+    # Provide MANY aliases so any template key works
+    chart_ctx = {
+        # labels
+        "dates": dates,
+        "labels": dates,
 
-    # launch angle
-    "la": la_series,
-    "la_series": la_series,
-    "la_values": la_series,
-    "launch_angle": la_series,
-    "launch_angle_values": la_series,
+        # exit velocity (template asks for "exitv")
+        "exitv": ev_series,              # <— the one your template expects
+        "ev": ev_series,
+        "ev_series": ev_series,
+        "ev_values": ev_series,
+        "exit_velocity": ev_series,
+        "exit_velocity_values": ev_series,
 
-    # spin rate
-    "sr": sr_series,
-    "sr_series": sr_series,
-    "sr_values": sr_series,
-    "spin_rate": sr_series,
-    "spin_rate_values": sr_series,
+        # launch angle
+        "la": la_series,
+        "la_series": la_series,
+        "la_values": la_series,
+        "launch_angle": la_series,
+        "launch_angle_values": la_series,
 
-    # very generic fallbacks some templates use
-    "values": ev_series,
-    "series": ev_series,
-}
-# --- END chart data
+        # spin rate
+        "sr": sr_series,
+        "sr_series": sr_series,
+        "sr_values": sr_series,
+        "spin_rate": sr_series,
+        "spin_rate_values": sr_series,
 
-ctx = {
-    "request": request,
-    "flash": pop_flash(request),
-    "player": player,
-    "age_bucket": age_bucket(player.age),
-    "latest_metrics": latest_metrics,
-    "last_note": last_note,
-    "drill_assignments": drills,
-    **chart_ctx,  # ← keep this
-}
-return templates.TemplateResponse("dashboard.html", ctx)
+        # very generic fallbacks some templates use
+        "values": ev_series,
+        "series": ev_series,
+    }
+    # --- END chart data
 
+    ctx = {
+        "request": request,
+        "flash": pop_flash(request),
+        "player": player,
+        "age_bucket": age_bucket(player.age),
+        "latest_metrics": latest_metrics,
+        "last_note": last_note,
+        "drill_assignments": drills,
+        **chart_ctx,
+    }
+    return templates.TemplateResponse("dashboard.html", ctx)
 
 # ------------------------- Instructor views -----------------------------------
 @app.get("/instructor")
@@ -605,46 +414,51 @@ def instructor_home(request: Request, db: Session = Depends(get_db)):
         set_flash(request, "Please log in as an instructor.")
         return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
-    # Determine last metric time per player
-    if _has_column("metrics", "recorded_at"):
-        last_metric_subq = (
-            select(
-                Metric.player_id.label("pid"),
-                func.max(Metric.recorded_at).label("last_metric_at"),
-            )
-            .group_by(Metric.player_id)
-            .subquery()
+    # Decide which timestamp column to use for "last metric"
+    use_recorded = _has_column("metrics", "recorded_at")
+    time_col = Metric.recorded_at if use_recorded else Metric.created_at
+
+    # Correlated subquery to count sessions per player without lazy loads
+    count_subq = (
+        select(func.count(Metric.id))
+        .where(Metric.player_id == Player.id)
+        .correlate(Player)
+        .scalar_subquery()
+    )
+
+    last_metric_subq = (
+        select(
+            Metric.player_id.label("pid"),
+            func.max(time_col).label("last_metric_at"),
         )
-        rows = db.execute(
-            select(Player, last_metric_subq.c.last_metric_at)
-            .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
-            .order_by(
-                func.coalesce(last_metric_subq.c.last_metric_at, text("'1970-01-01 00:00:00'")).desc(),
-                Player.id.desc(),
-            )
-        ).all()
-    else:
-        rows = db.execute(
-            select(Player, text("NULL as last_metric_at")).order_by(Player.id.desc())
-        ).all()
+        .group_by(Metric.player_id)
+        .subquery()
+    )
 
-    session_counts = _session_counts_by_player(db)
-    fav_ids = _get_favorites(db, request.session["instructor_id"])
-    grouped = _group_players(rows, session_counts, fav_ids=fav_ids)
+    rows = db.execute(
+        select(Player, last_metric_subq.c.last_metric_at, count_subq.label("sessions"))
+        .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
+        # SQLite has no NULLS LAST; coalesce to an old date so NULLs sort last
+        .order_by(func.coalesce(last_metric_subq.c.last_metric_at, text("'1970-01-01 00:00:00'")).desc(), Player.id.desc())
+    ).all()
 
-    players = []
-    for p, last_raw in rows:
-        players.append({
-            "player": _player_to_dict(p),
-            "last_update": _parse_dt_from_db(last_raw),
-        })
+    # favorites flag (from column if present, else False)
+    fav_col_exists = _has_column("players", "favorite")
 
-    ctx = {
-        "request": request,
-        "flash": pop_flash(request),
-        "players": players,
-        "grouped": grouped,   # used by instructor_dashboard.html
-    }
+    def is_fav(p: Player) -> bool:
+        try:
+            return bool(getattr(p, "favorite", 0)) if fav_col_exists else False
+        except Exception:
+            return False
+
+    # Group by age bucket into the structure the template expects:
+    # grouped[bucket] = [(player, sessions_count, is_favorite), ...]
+    grouped: Dict[str, List[Tuple[Player, int, bool]]] = {}
+    for p, last_at, sessions_count in rows:
+        bucket = age_bucket(p.age)
+        grouped.setdefault(bucket, []).append((p, int(sessions_count or 0), is_fav(p)))
+
+    ctx = {"request": request, "flash": pop_flash(request), "grouped": grouped}
     return templates.TemplateResponse("instructor_dashboard.html", ctx)
 
 @app.get("/instructor/player/{player_id}")
@@ -676,66 +490,6 @@ def instructor_player_detail(player_id: int, request: Request, db: Session = Dep
     return templates.TemplateResponse("instructor_player_detail.html", ctx)
 
 # ------------------------- Instructor actions (writes) -------------------------
-
-@app.post("/players/create")
-async def create_player(
-    request: Request,
-    name: Optional[str] = Form(None),
-    age: Optional[int] = Form(None),
-    phone: Optional[str] = Form(None),
-    login_code: Optional[str] = Form(None),
-    db: Session = Depends(get_db),
-):
-    """
-    Creates a player.
-    - Works for HTML form posts (Form(...))
-    - Also accepts JSON payloads: {"name": "...", "age": 12, "phone": "...", "login_code": "..."}
-    Redirects back to /instructor for HTML accepts; returns JSON otherwise.
-    """
-    if not request.session.get("instructor_id"):
-        if "text/html" in (request.headers.get("accept") or ""):
-            set_flash(request, "Please log in as an instructor.")
-            return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
-        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-
-    # If this wasn't a form submit, try JSON body
-    if name is None:
-        try:
-            payload = await request.json()
-        except Exception:
-            payload = {}
-        name = payload.get("name")
-        age = payload.get("age")
-        phone = payload.get("phone")
-        login_code = payload.get("login_code")
-
-    if not name or not str(name).strip():
-        return JSONResponse({"ok": False, "error": "name_required"}, status_code=400)
-
-    # Determine a login code (normalize provided or generate unique)
-    if login_code and str(login_code).strip():
-        raw_code = str(login_code).strip()
-    else:
-        raw_code = _generate_unique_code(db)
-
-    norm_code = normalize_code(raw_code)
-
-    p = Player(
-        name=str(name).strip(),
-        age=age if (isinstance(age, int) or age is None) else None,
-        phone=(str(phone).strip() or None) if phone is not None else None,
-        login_code=norm_code,
-    )
-    db.add(p)
-    db.commit()
-    db.refresh(p)
-
-    if "text/html" in (request.headers.get("accept") or ""):
-        set_flash(request, f"Player '{p.name}' created. Code: {raw_code}")
-        return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
-
-    return JSONResponse({"ok": True, "player_id": p.id, "login_code": raw_code})
-
 @app.post("/instructor/player/{player_id}/metric")
 def add_metric(
     player_id: int,
@@ -796,6 +550,7 @@ def assign_drill(
     request: Request,
     drill_id: int = Form(...),
     note: Optional[str] = Form(None),
+    due_date: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
     if not request.session.get("instructor_id"):
@@ -807,38 +562,58 @@ def assign_drill(
         drill_id=drill_id,
         note=(note or "").strip() or None,
         status="assigned",
+        due_date=(due_date or None),
     )
     db.add(a)
     db.commit()
     return JSONResponse({"ok": True})
 
-# --------------- Favorites toggle (fixes POST /favorite/<id> 404) -------------
+# ------------------------- Additional endpoints used by templates -------------
+@app.post("/players/create")
+def create_player(
+    request: Request,
+    name: str = Form(...),
+    age: Optional[int] = Form(None),
+    code: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    if not request.session.get("instructor_id"):
+        set_flash(request, "Please log in as an instructor.")
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+    p = Player(
+        name=name.strip(),
+        age=age,
+        login_code=(normalize_code(code) if code else None),
+    )
+    db.add(p)
+    db.commit()
+    set_flash(request, f"Player '{p.name}' created.")
+    return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
+
 @app.post("/favorite/{player_id}")
 def toggle_favorite(player_id: int, request: Request, db: Session = Depends(get_db)):
-    iid = request.session.get("instructor_id")
-    if not iid:
+    if not request.session.get("instructor_id"):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-    # Toggle: delete if exists, else insert
-    exists = db.execute(
-        text("SELECT 1 FROM favorites WHERE instructor_id = :iid AND player_id = :pid"),
-        {"iid": iid, "pid": player_id}
-    ).first()
+    p = db.get(Player, player_id)
+    if not p:
+        return JSONResponse({"ok": False, "error": "player_not_found"}, status_code=404)
 
-    if exists:
-        db.execute(
-            text("DELETE FROM favorites WHERE instructor_id = :iid AND player_id = :pid"),
-            {"iid": iid, "pid": player_id}
-        )
-        db.commit()
-        return JSONResponse({"ok": True, "favorite": False})
-    else:
-        db.execute(
-            text("INSERT INTO favorites (instructor_id, player_id) VALUES (:iid, :pid)"),
-            {"iid": iid, "pid": player_id}
-        )
-        db.commit()
-        return JSONResponse({"ok": True, "favorite": True})
+    # Use DB column if available; else no-op but still return ok for UX
+    if _has_column("players", "favorite"):
+        try:
+            current = int(getattr(p, "favorite", 0) or 0)
+            setattr(p, "favorite", 0 if current else 1)
+            db.commit()
+            return JSONResponse({"ok": True, "favorite": int(getattr(p, "favorite", 0) or 0)})
+        except Exception as e:
+            print(f"[favorite] could not toggle: {e}")
+            db.rollback()
+            return JSONResponse({"ok": False, "error": "toggle_failed"}, status_code=500)
+
+    # Fallback: pretend success if column unavailable (shouldn’t happen after ensure)
+    return JSONResponse({"ok": True, "favorite": 0})
 
 # ------------------------- Health check ---------------------------------------
 @app.get("/healthz")

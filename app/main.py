@@ -51,6 +51,18 @@ def _datetimeformat(value, fmt="%Y-%m-%d"):
     return dt.strftime(fmt)
 
 templates.env.filters["datetimeformat"] = _datetimeformat
+def _initials(value: str, max_letters: int = 2) -> str:
+    """Jinja filter: 'John Q Public' -> 'JQ' (up to max_letters)."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    parts = [p for p in s.split() if p]
+    if not parts:
+        return ""
+    letters = "".join(p[0] for p in parts[:max_letters])
+    return letters.upper()
+
+templates.env.filters["initials"] = _initials
 
 # -----------------------------------------------------------------------------
 # DB helpers / schema

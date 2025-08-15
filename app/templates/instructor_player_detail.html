@@ -103,24 +103,28 @@
     </section>
 
     <!-- Assigned Drills (read-only list) -->
-    <section class="card">
-      <h3 class="section-title">Assigned Drills</h3>
-      <ul class="list mt-1">
-        {% for a in assignments or [] %}
-          <li>
-            <div><strong>{{ a.drill_name or "Drill" }}</strong> — {{ a.status or 'assigned' }}</div>
-            {% if a.note %}<div class="muted">“{{ a.note }}”</div>{% endif %}
-            <div class="muted">
-              Assigned: {{ a.created_at|datetimeformat("%Y-%m-%d") }}
-              {% if a.due_date %} • Due: {{ a.due_date|datetimeformat("%Y-%m-%d") }}{% endif %}
-            </div>
-          </li>
-        {% else %}
-          <li class="muted">No assigned drills yet.</li>
-        {% endfor %}
-      </ul>
-    </section>
+<section class="card">
+  <h3 class="section-title">Assign a Drill</h3>
+
+  <!-- quick-assign (keep as-is if you already have it) -->
+  <form method="post" action="/drills/assign" class="form row">
+    <input type="hidden" name="player_id" value="{{ player.id }}"/>
+    <select name="drill_id" required>
+      <option value="" disabled selected>Select a drill</option>
+      {% for d in drills %}
+        <option value="{{ d.id }}">{{ d.title }}</option>
+      {% endfor %}
+    </select>
+    <input name="note" placeholder="Optional note"/>
+    <button class="btn btn-red">Assign</button>
+  </form>
+
+  <!-- NEW: go to full library -->
+  <div class="mt-1">
+    <a class="btn btn-ghost" href="/drills?player_id={{ player.id }}">Open Drill Library</a>
   </div>
+</section>
+
 
   <!-- Scripts -->
   <script>

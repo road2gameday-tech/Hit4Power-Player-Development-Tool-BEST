@@ -19,6 +19,57 @@ from .database import SessionLocal, engine, Base
 from .models import Player, Instructor, Metric, Note, DrillAssignment
 from .utils import normalize_code, hash_code, set_flash, pop_flash, age_bucket
 
+from collections import defaultdict
+from datetime import datetime
+
+def _chart_series(db: Session, player_id: int):
+    """
+    Build simple timeseries for common hitting metrics.
+    Returns (dates[], ev[], la[], sr[]), where dates are 'YYYY-MM-DD' strings.
+    Missing metrics -> empty lists.
+    """
+    rows = db.execute(
+        select(Metric)
+        .where(Metric.player_id == player_id)
+        .order_by(Metric.recorded_at.asc())
+    ).scalars().all()
+
+    if not rows:
+        return [], [], [], []
+
+    # Collect unique day labels in order
+    def _day(v):
+        if isinstance(v, datetime):
+            return v.date().isoformat()
+        # strings like "2025-01-05 12:34" or "2025-01-05"
+        s = str(v).strip()
+        return s[:10] if len(s) >= 10 else s
+
+    labels = []
+    seen = set()
+    for r in rows:
+        d = _day(r.recorded_at)
+        if d not in seen:
+            labels.append(d)
+            seen.add(d)
+
+    # Map date -> value for each metric we care about
+    wanted = {
+        "exit_velocity": defaultdict(lambda: None),
+        "launch_angle": defaultdict(lambda: None),
+        "spin_rate": defaultdict(lambda: None),
+    }
+    for r in rows:
+        m = (r.metric or "").strip().lower()
+        if m in wanted:
+            wanted[m][_day(r.recorded_at)] = r.value
+
+    ev = [wanted["exit_velocity"][d] for d in labels]
+    la = [wanted["launch_angle"][d] for d in labels]
+    sr = [wanted["spin_rate"][d] for d in labels]
+    return labels, ev, la, sr
+
+
 # ------------------------------------------------------------------------------
 # App setup
 # ------------------------------------------------------------------------------
@@ -491,7 +542,19 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         .where(DrillAssignment.player_id == pid, DrillAssignment.status != "archived")
         .order_by(DrillAssignment.created_at.desc())
     ).scalars().all()
-
+    
+ # --- NEW: chart data so Jinja |tojson never sees Undefined
+    dates, ev_series, la_series, sr_series = _chart_series(db, pid)
+    # Provide multiple aliases to match whatever the template expects
+    chart_ctx = {
+        "dates": dates,
+        "ev_series": ev_series, "la_series": la_series, "sr_series": sr_series,
+        "ev": ev_series, "la": la_series, "sr": sr_series,
+        "ev_values": ev_series, "la_values": la_series, "sr_values": sr_series,
+        "values": ev_series,  # generic alias some templates use
+    }
+    # --- END NEW
+    
     ctx = {
         "request": request,
         "flash": pop_flash(request),
@@ -500,6 +563,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
         "latest_metrics": latest_metrics,
         "last_note": last_note,
         "drill_assignments": drills,
+         **chart_ctx,  # NEW
     }
     return templates.TemplateResponse("dashboard.html", ctx)
 

@@ -1,21 +1,48 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="{{ request.cookies.get('theme', 'dark') }}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
     <title>{{ title or "Hit4Power" }}</title>
-    <link rel="stylesheet" href="/static/css/style.css" />
-    <script defer src="/static/js/main.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <!-- Core styles -->
+    <link rel="stylesheet" href="{{ url_for('static', path='css/style.css') }}" />
+
+    <!-- Preload logo for faster first paint -->
+    <link rel="preload" as="image" href="{{ url_for('static', path='logos/Hit4PowerMainLogoDark.png') }}" />
+
+    <!-- App script (theme toggle, etc.) -->
+    <script defer src="{{ url_for('static', path='js/main.js') }}"></script>
+
+    <!-- Chart.js (pinned + SRI). If you vendor it locally later, swap to url_for('static', ...) -->
+    <script
+      defer
+      src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"
+      integrity="sha384-fC4c0tK0yS8pP9y/1mipfLQm7m9uAk7Wc8J2sR6uRZ0g7rF6o4R2tQxq3oR4lF4Z"
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    ></script>
+
+    {# Optional page-specific head content #}
+    {% block extra_head %}{% endblock %}
   </head>
   <body class="page">
-    <header class="header">
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="header" role="banner">
       <div class="header-left">
-        <a href="/" class="logo-link">
-          <img id="site-logo" src="/static/logos/Hit4PowerMainLogoDark.png" alt="Hit4Power" class="logo"/>
+        <a href="/" class="logo-link" aria-label="Hit4Power home">
+          <img
+            id="site-logo"
+            src="{{ url_for('static', path='logos/Hit4PowerMainLogoDark.png') }}"
+            alt="Hit4Power"
+            class="logo"
+          />
         </a>
       </div>
-      <nav class="nav">
+
+      <nav class="nav" aria-label="Primary">
         {% if request.session.get('instructor_id') %}
           <a href="/instructor" class="nav-link">Clients</a>
         {% endif %}
@@ -25,24 +52,27 @@
         {% if request.session.get('player_id') or request.session.get('instructor_id') %}
           <a href="/logout" class="nav-link btn btn-outline-red">Logout</a>
         {% endif %}
-        <button id="theme-toggle" class="nav-link btn btn-ghost" title="Toggle theme">Theme</button>
+        <button id="theme-toggle" class="nav-link btn btn-ghost" type="button" title="Toggle theme">Theme</button>
       </nav>
     </header>
 
-    <main class="container">
+    <main id="main" class="container" role="main">
       {% set flash = pop_flash(request) %}
       {% if flash %}
-        <div class="flash">{{ flash }}</div>
+        <div class="flash" role="status" aria-live="polite">{{ flash }}</div>
       {% endif %}
       {% block content %}{% endblock %}
     </main>
 
     <footer class="footer">
-      <div class="spacer"></div>
+      <div class="spacer" aria-hidden="true"></div>
       <div class="footer-actions">
         <a class="btn btn-red" href="https://www.instagram.com/hit4.power/" target="_blank" rel="noopener">Instagram</a>
         <a class="btn btn-red" href="https://www.hit4power.com/" target="_blank" rel="noopener">Website</a>
       </div>
     </footer>
+
+    {# Optional page-specific scripts #}
+    {% block extra_scripts %}{% endblock %}
   </body>
 </html>

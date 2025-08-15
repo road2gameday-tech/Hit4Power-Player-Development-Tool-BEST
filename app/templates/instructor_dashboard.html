@@ -1,91 +1,131 @@
 {% extends "base.html" %}
 {% set title = "Clients" %}
+
 {% block content %}
-  <div class="toolbar">
-    <h2>Clients</h2>
-<nav class="tabs mb-2">
-  <a class="tab{% if filter == 'favorites' %} active{% endif %}" href="/instructor?filter=favorites">My Clients</a>
-  <a class="tab{% if filter != 'favorites' %} active{% endif %}" href="/instructor?filter=all">All Clients</a>
-</nav>
+
+  <!-- Page header with tabs -->
+  <div class="page-header">
+    <h2 class="page-title">Clients</h2>
+    <nav class="tabs">
+      <a href="/instructor?filter=favorites"
+         class="tab {{ 'active' if (filter == 'favorites') else '' }}">My Clients</a>
+      <a href="/instructor?filter=all"
+         class="tab {{ 'active' if (filter != 'favorites') else '' }}">All Clients</a>
+    </nav>
+  </div>
 
   <div class="grid two">
-    <section class="card">
-      <h3 class="section-title">Create Player</h3>
-      <form method="post" action="/players/create" enctype="multipart/form-data" class="form">
-        <label>Player Name</label>
-        <input name="name" required />
-        <label>Age</label>
-        <input name="age" type="number" min="7" max="30" value="12" required />
-        <label>Phone (for texts, optional)</label>
-        <input name="phone" placeholder="+15551234567"/>
-        <label>Player Image (optional)</label>
-        <input name="image" type="file" accept="image/*"/>
-        <button class="btn btn-red">Create</button>
-      </form>
+    <!-- LEFT COLUMN: forms -->
+    <div class="vstack">
+      <!-- Create Player -->
+      <section class="card">
+        <h3 class="section-title">Create Player</h3>
+        <form method="post" action="/players/create" enctype="multipart/form-data" class="form">
+          <label>Player Name</label>
+          <input name="name" placeholder="Full name" required />
 
-      <h3 class="section-title mt-2">Bulk Import CSV</h3>
-      <form method="post" action="/players/bulk_upload" enctype="multipart/form-data" class="form">
-        <input name="file" type="file" accept=".csv" required />
-        <button class="btn btn-red">Import</button>
-      </form>
-    </section>
+          <label>Age</label>
+          <input name="age" type="number" min="4" max="100" placeholder="12" />
 
+          <label>Phone (for texts, optional)</label>
+          <input name="phone" type="tel" placeholder="+15551234567" />
+
+          <label>Player Image (optional)</label>
+          <input type="file" name="image" accept="image/*" />
+
+          <button class="btn btn-red mt-1">Create</button>
+        </form>
+      </section>
+
+      <!-- Drill Library / Add Drill -->
+      <section class="card">
+        <h3 class="section-title">Drill Library <span class="muted">(Instructor only)</span></h3>
+
+        <div class="row gap">
+          <a class="btn btn-ghost" href="/drills">Open Library</a>
+        </div>
+
+        {% if request %}
+        <form method="post" action="/drills/create" class="form mt-1">
+          <label>Title</label>
+          <input name="title" placeholder="e.g., Top-hand tee" required />
+
+          <label>Description (optional)</label>
+          <textarea name="description" rows="3" placeholder="What to focus on…"></textarea>
+
+          <label>Video URL (YouTube/Vimeo or file link)</label>
+          <input name="video_url" placeholder="https://…" />
+
+          <button class="btn btn-red mt-1">Add Drill</button>
+        </form>
+        {% endif %}
+      </section>
+    </div>
+
+    <!-- RIGHT COLUMN: players -->
     <section class="card">
-      <h3 class="section-title">Drill Library (Instructor only)</h3>
-      <form method="post" action="/drills/create" class="form">
-        <label>Title</label>
-        <input name="title" required/>
-        <label>Description (optional)</label>
-        <textarea name="description" rows="2"></textarea>
-        <label>Video URL (YouTube/Vimeo or file link)</label>
-        <input name="video_url"/>
-        <button class="btn btn-red">Add Drill</button>
-      </form>
+      {% set has_groups = grouped is defined and grouped %}
+      {% if has_groups %}
+        {% for group_name, arr in grouped.items() %}
+          <div class="list-header">
+            <h4 class="list-title">{{ group_name }}</h4>
+          </div>
+
+          {% if arr and arr|length > 0 %}
+            <div class="players-grid">
+              {% for p in arr %}
+                <div class="player-card">
+                  <a class="player-link" href="/instructor/player/{{ p.id }}">
+                    <div class="avatar sm">
+                      {% if p.image_path %}
+                        <img src="{{ p.image_path }}" alt="{{ p.name }}"/>
+                      {% else %}
+                        <div class="avatar-placeholder">{{ (p.name or '')[:1] }}</div>
+                      {% endif %}
+                    </div>
+                    <div class="player-meta">
+                      <div class="player-name">{{ p.name }}</div>
+                      {% if p.login_code %}
+                        <div class="muted">Code: {{ p.login_code }}</div>
+                      {% endif %}
+                    </div>
+                  </a>
+                  <button class="star" data-player="{{ p.id }}">
+                    <span class="star-shape {{ 'on' if p.is_favorite else '' }}">★</span>
+                  </button>
+                </div>
+              {% endfor %}
+            </div>
+          {% else %}
+            <div class="muted">No players in this group.</div>
+          {% endif %}
+        {% endfor %}
+      {% else %}
+        <div class="muted">No players to show yet.</div>
+      {% endif %}
     </section>
   </div>
 
-  {% for bucket, arr in grouped.items() %}
-    <section class="card">
-      <h3 class="section-title">{{ bucket }}</h3>
-      <div class="roster">
-        {% for p, sessions, is_fav in arr %}
-          <a class="player-card" href="/instructor/player/{{ p.id }}">
-            <div class="avatar sm">
-              {% if p.image_path %}
-                <img src="{{ p.image_path }}" alt="{{ p.name }}"/>
-              {% else %}
-                <div class="avatar-placeholder">{{ p.name[0] }}</div>
-              {% endif %}
-            </div>
-            <div class="player-meta">
-              <div class="name">{{ p.name }}</div>
-              <div class="muted">Sessions: {{ p.metrics|length }}</div>
-            </div>
-            <button class="star" data-player="{{ p.id }}" aria-label="My Client">
-              <span class="star-shape {% if is_fav %}on{% endif %}">★</span>
-            </button>
-          </a>
-        {% else %}
-          <div class="muted">No players in this group.</div>
-        {% endfor %}
-      </div>
-    </section>
-  {% endfor %}
-
   <script>
-    // star toggles
-    document.querySelectorAll('.star').forEach(btn => {
-      btn.addEventListener('click', async (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const pid = btn.dataset.player;
-        const res = await fetch(`/favorite/${pid}`, { method: 'POST' });
-        const j = await res.json().catch(()=>({}));
-        const span = btn.querySelector('.star-shape');
-        if (j && j.favorited !== undefined) {
-          span.classList.toggle('on', j.favorited);
-        }
+    // Star toggle (favorites)
+    (function () {
+      const stars = document.querySelectorAll('.player-card .star');
+      stars.forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const pid = btn.dataset.player;
+          try {
+            const res = await fetch(`/favorite/${pid}`, { method: 'POST' });
+            const j = await res.json();
+            const on = !!(j && (j.favorited ?? j.favorite));
+            btn.querySelector('.star-shape').classList.toggle('on', on);
+          } catch (err) {
+            console.error(err);
+          }
+        });
       });
-    });
+    })();
   </script>
+
 {% endblock %}

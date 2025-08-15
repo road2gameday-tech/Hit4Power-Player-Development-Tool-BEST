@@ -1,44 +1,46 @@
+# app/routes.py
 import os
-from fastapi import FastAPI, Request, Depends, Form, UploadFile, File, BackgroundTasks, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from starlette.middleware.sessions import SessionMiddleware
-from sqlalchemy.orm import Session
-from sqlalchemy import func, select, delete
-from typing import Optional, List
 from datetime import datetime
-from itsdangerous import URLSafeSerializer
-from jinja2 import pass_environment
-from markupsafe import Markup, escape
+from typing import Optional, List
+
+from fastapi import FastAPI, Request, Depends, Form, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+from starlette import status
+
+from sqlalchemy import func, select, and_
+from sqlalchemy.orm import Session
 
 from .database import SessionLocal, engine, Base
-from .models import Player, Instructor, Metric, Note, Drill, DrillAssignment, InstructorFavorite
-from .utils import generate_code, age_bucket
+from .models import (
+    Player, Instructor, Metric, Note, Drill, DrillAssignment, InstructorFavorite
+)
+from .utils import (
+    normalize_code, hash_code, set_flash, pop_flash, age_bucket
+)
 
-# ----- App setup -----
-app = FastAPI(title="Hit4Power Development Tool")
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY", "dev-secret"))
+# ------------------------------------------------------------------------------
+# App setup
+# ------------------------------------------------------------------------------
+app = FastAPI()
 
-# static & templates
+# Sessions (required for flash + auth)
+SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-insecure-session-secret")
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax", https_only=False)
+
+# Static files & templates
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
-# Jinja filters
-@pass_environment
-def datetimeformat(env, value, fmt="%b %d, %Y"):
-    if not value:
-        return ""
-    if isinstance(value, datetime):
-        return value.strftime(fmt)
-    try:
-        return datetime.fromisoformat(str(value)).strftime(fmt)
-    except Exception:
-        return str(value)
-templates.env.filters["datetimeformat"] = datetimeformat
-templates.env.filters["age_bucket"] = age_bucket
+# Create tables if they don't exist yet (ok for demo; use Alembic in prod)
+Base.metadata.create_all(bind=engine)
 
-# ----- DB dependency -----
+
+# ------------------------------------------------------------------------------
+# DB dependency
+# ------------------------------------------------------------------------------
 def get_db():
     db = SessionLocal()
     try:
@@ -46,319 +48,294 @@ def get_db():
     finally:
         db.close()
 
-# ----- Initialize DB -----
-Base.metadata.create_all(bind=engine)
 
-# Seed a default instructor if none exists
-def ensure_default_instructor(db: Session):
-    default_code = os.getenv("INSTRUCTOR_DEFAULT_CODE", "change-me-1234")
-    existing = db.execute(select(Instructor).limit(1)).scalar_one_or_none()
-    if not existing:
-        coach = Instructor(name="Coach", login_code=default_code)
-        db.add(coach); db.commit()
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 
-# ----- Helpers -----
-def current_player(request: Request, db: Session) -> Optional[Player]:
-    pid = request.session.get("player_id")
-    if not pid:
-        return None
-    return db.get(Player, pid)
+def _login_lookup(db: Session, model, raw_code: str):
+    """
+    Flexible login lookup:
+      1) Try normalized plaintext match (if you store normalized codes)
+      2) Try hashed match (if you store HMAC of normalized)
+    Works for Player and Instructor since both have .login_code.
+    """
+    norm = normalize_code(raw_code)
+    # a) plaintext normalized
+    obj = db.execute(
+        select(model).where(model.login_code == norm)
+    ).scalar_one_or_none()
+    if obj:
+        return obj
+    # b) hashed
+    hashed = hash_code(raw_code)
+    obj = db.execute(
+        select(model).where(model.login_code == hashed)
+    ).scalar_one_or_none()
+    return obj
 
-def current_instructor(request: Request, db: Session) -> Optional[Instructor]:
-    iid = request.session.get("instructor_id")
-    if not iid:
-        return None
-    return db.get(Instructor, iid)
 
-def twilio_client():
-    from twilio.rest import Client
-    sid = os.getenv("TWILIO_ACCOUNT_SID")
-    token = os.getenv("TWILIO_AUTH_TOKEN")
-    if not sid or not token:
-        return None
-    return Client(sid, token)
+def _latest_metrics_query(player_id: int):
+    """
+    Returns a selectable that yields the latest row per (player_id, metric).
+    """
+    subq = (
+        select(
+            Metric.metric.label("metric"),
+            func.max(Metric.recorded_at).label("latest")
+        )
+        .where(Metric.player_id == player_id)
+        .group_by(Metric.metric)
+        .subquery()
+    )
 
-def send_text_async(to_number: str, body: str):
-    client = twilio_client()
-    if not client or not to_number:
-        return
-    from_num = os.getenv("TWILIO_FROM_NUMBER")
-    try:
-        client.messages.create(to=to_number, from_=from_num, body=body)
-    except Exception as e:
-        # swallow errors in background
-        print("Twilio error:", e)
+    stmt = (
+        select(Metric)
+        .where(Metric.player_id == player_id)
+        .join(
+            subq,
+            and_(
+                Metric.metric == subq.c.metric,
+                Metric.recorded_at == subq.c.latest,
+            )
+        )
+        .order_by(Metric.metric.asc())
+    )
+    return stmt
 
-# ----- Routes -----
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request, db: Session = Depends(get_db)):
-    ensure_default_instructor(db)
-    ctx = {"request": request, "title": "Login"}
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
+
+@app.get("/")
+def index(request: Request):
+    # Always pass {"request": request} to templates; flash is read-only in templates
+    ctx = {"request": request, "flash": pop_flash(request)}
     return templates.TemplateResponse("index.html", ctx)
+
 
 @app.post("/login/player")
 def login_player(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
-    p = db.execute(select(Player).where(Player.login_code == code.strip())).scalar_one_or_none()
-    if not p:
-        return templates.TemplateResponse("index.html", {"request": request, "error": "Invalid player code"})
-    request.session.clear()
-    request.session["player_id"] = p.id
-    return RedirectResponse(url="/dashboard", status_code=303)
+    player = _login_lookup(db, Player, code)
+    if not player:
+        set_flash(request, "Invalid code. Please try again.")
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+    # Auth OK
+    request.session["player_id"] = player.id
+    # Clear any instructor session
+    request.session.pop("instructor_id", None)
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
 
 @app.post("/login/instructor")
 def login_instructor(request: Request, code: str = Form(...), db: Session = Depends(get_db)):
-    i = db.execute(select(Instructor).where(Instructor.login_code == code.strip())).scalar_one_or_none()
-    if not i:
-        return templates.TemplateResponse("index.html", {"request": request, "error": "Invalid instructor code"})
-    request.session.clear()
-    request.session["instructor_id"] = i.id
-    return RedirectResponse(url="/instructor", status_code=303)
+    coach = _login_lookup(db, Instructor, code)
+    if not coach:
+        set_flash(request, "Invalid code. Please try again.")
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+    request.session["instructor_id"] = coach.id
+    request.session.pop("player_id", None)
+    return RedirectResponse(url="/instructor", status_code=status.HTTP_303_SEE_OTHER)
+
 
 @app.get("/logout")
 def logout(request: Request):
-    request.session.clear()
-    return RedirectResponse(url="/", status_code=303)
+    request.session.pop("player_id", None)
+    request.session.pop("instructor_id", None)
+    set_flash(request, "You have been logged out.")
+    return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
-# ----- Player dashboard -----
-@app.get("/dashboard", response_class=HTMLResponse)
+
+# ------------------------- Player dashboard -----------------------------------
+
+@app.get("/dashboard")
 def dashboard(request: Request, db: Session = Depends(get_db)):
-    player = current_player(request, db)
+    pid = request.session.get("player_id")
+    if not pid:
+        set_flash(request, "Please log in first.")
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+    player = db.get(Player, pid)
     if not player:
-        return RedirectResponse("/", status_code=303)
-    # metrics sorted by date
-    rows = db.execute(select(Metric).where(Metric.player_id == player.id).order_by(Metric.date.asc())).scalars().all()
-    dates = [m.date.strftime("%Y-%m-%d") for m in rows]
-    exitv = [m.exit_velocity or 0 for m in rows]
-    shared_notes = db.execute(select(Note).where(Note.player_id == player.id, Note.shared == True).order_by(Note.created_at.desc())).scalars().all()
-    drills = db.execute(select(DrillAssignment).where(DrillAssignment.player_id == player.id).order_by(DrillAssignment.created_at.desc())).scalars().all()
+        set_flash(request, "Player not found.")
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+    latest_metrics = db.execute(_latest_metrics_query(pid)).scalars().all()
+
+    # Most recent shared note
+    last_note = db.execute(
+        select(Note)
+        .where(Note.player_id == pid, Note.shared == True)  # noqa: E712
+        .order_by(Note.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    # Active drill assignments
+    drills = db.execute(
+        select(DrillAssignment)
+        .where(DrillAssignment.player_id == pid, DrillAssignment.status != "archived")
+        .order_by(DrillAssignment.created_at.desc())
+    ).scalars().all()
+
     ctx = {
         "request": request,
+        "flash": pop_flash(request),
         "player": player,
-        "dates": dates,
-        "exitv": exitv,
-        "shared_notes": shared_notes,
-        "drills": drills,
+        "age_bucket": age_bucket(player.age),
+        "latest_metrics": latest_metrics,
+        "last_note": last_note,
+        "drill_assignments": drills,
     }
     return templates.TemplateResponse("dashboard.html", ctx)
 
-# ----- Instructor dashboard (Clients) -----
-@app.get("/instructor", response_class=HTMLResponse)
+
+# ------------------------- Instructor views -----------------------------------
+
+@app.get("/instructor")
 def instructor_home(request: Request, db: Session = Depends(get_db)):
-    instr = current_instructor(request, db)
-    if not instr:
-        return RedirectResponse("/", status_code=303)
+    iid = request.session.get("instructor_id")
+    if not iid:
+        set_flash(request, "Please log in as an instructor.")
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
 
-    # group by age buckets
-    players = db.execute(select(Player)).scalars().all()
-    # sessions count per player (metric entries)
-    counts = dict(db.execute(select(Metric.player_id, func.count(Metric.id)).group_by(Metric.player_id)).all())
-    # favorites
-    fav_ids = set([fav.player_id for fav in instr.favorites])
+    # Simple roster ordered by most recently updated metric or player update
+    last_metric_subq = (
+        select(
+            Metric.player_id.label("pid"),
+            func.max(Metric.recorded_at).label("last_metric_at")
+        )
+        .group_by(Metric.player_id)
+        .subquery()
+    )
 
-    grouped = {"7-9": [], "10-12": [], "13-15": [], "16-18": [], "18+": []}
-    for p in players:
-        bucket = age_bucket(p.age)
-        if bucket in grouped:
-            grouped[bucket].append((p, counts.get(p.id, 0), (p.id in fav_ids)))
+    rows = db.execute(
+        select(Player, last_metric_subq.c.last_metric_at)
+        .outerjoin(last_metric_subq, Player.id == last_metric_subq.c.pid)
+        .order_by(func.coalesce(last_metric_subq.c.last_metric_at, Player.updated_at).desc())
+    ).all()
 
-    my_clients = [ (p, counts.get(p.id,0)) for (p, c, fav) in [(pp, counts.get(pp.id,0), (pp.id in fav_ids)) for pp in players] if (p.id in fav_ids) ]
+    players = [{"player": r[0], "last_update": r[1]} for r in rows]
+
+    ctx = {"request": request, "flash": pop_flash(request), "players": players}
+    return templates.TemplateResponse("instructor_dashboard.html", ctx)
+
+
+@app.get("/instructor/player/{player_id}")
+def instructor_player_detail(player_id: int, request: Request, db: Session = Depends(get_db)):
+    if not request.session.get("instructor_id"):
+        set_flash(request, "Please log in as an instructor.")
+        return RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+
+    player = db.get(Player, player_id)
+    if not player:
+        raise HTTPException(status_code=404, detail="Player not found")
+
+    latest_metrics = db.execute(_latest_metrics_query(player_id)).scalars().all()
+    notes = db.execute(
+        select(Note).where(Note.player_id == player_id).order_by(Note.created_at.desc()).limit(25)
+    ).scalars().all()
+    assignments = db.execute(
+        select(DrillAssignment).where(DrillAssignment.player_id == player_id).order_by(DrillAssignment.created_at.desc())
+    ).scalars().all()
 
     ctx = {
         "request": request,
-        "instr": instr,
-        "grouped": grouped,
-        "fav_ids": fav_ids,
-        "my_clients_count": len(fav_ids),
+        "flash": pop_flash(request),
+        "player": player,
+        "latest_metrics": latest_metrics,
+        "notes": notes,
+        "assignments": assignments,
     }
-    return templates.TemplateResponse("instructor_dashboard.html", ctx)
-
-# Toggle favorite
-@app.post("/favorite/{player_id}")
-def favorite_player(request: Request, player_id: int, db: Session = Depends(get_db)):
-    instr = current_instructor(request, db)
-    if not instr:
-        raise HTTPException(status_code=403, detail="Not instructor")
-    existing = db.execute(select(InstructorFavorite).where(
-        InstructorFavorite.instructor_id == instr.id, InstructorFavorite.player_id == player_id
-    )).scalar_one_or_none()
-    if existing:
-        db.execute(delete(InstructorFavorite).where(InstructorFavorite.id == existing.id))
-        db.commit()
-        return JSONResponse({"favorited": False})
-    fav = InstructorFavorite(instructor_id=instr.id, player_id=player_id)
-    db.add(fav); db.commit()
-    return JSONResponse({"favorited": True})
-
-# Create player
-@app.post("/players/create", response_class=HTMLResponse)
-async def create_player(
-    request: Request,
-    name: str = Form(...),
-    age: int = Form(...),
-    phone: Optional[str] = Form(None),
-    image: Optional[UploadFile] = File(None),
-    db: Session = Depends(get_db),
-):
-    instr = current_instructor(request, db)
-    if not instr:
-        return RedirectResponse("/", status_code=303)
-    code = generate_code(prefix="P-")
-    p = Player(name=name.strip(), age=int(age), login_code=code, phone=phone.strip() if phone else None)
-    db.add(p); db.commit(); db.refresh(p)
-
-    # save image if provided
-    if image and image.filename:
-        uploads_dir = "app/static/uploads/players"
-        os.makedirs(uploads_dir, exist_ok=True)
-        ext = os.path.splitext(image.filename)[1].lower() or ".jpg"
-        path = f"{uploads_dir}/player_{p.id}{ext}"
-        with open(path, "wb") as f:
-            f.write(await image.read())
-        p.image_path = path.replace("app/", "/")  # serve under /static
-        db.add(p); db.commit()
-
-    # Show success on instructor page with code
-    request.session["flash"] = f"Player created. Login code: {code}"
-    return RedirectResponse("/instructor", status_code=303)
-
-# Bulk CSV upload (name,age,phone)
-@app.post("/players/bulk_upload")
-async def bulk_upload(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
-    instr = current_instructor(request, db)
-    if not instr:
-        return RedirectResponse("/", status_code=303)
-    content = (await file.read()).decode("utf-8", errors="ignore")
-    created = []
-    for line in content.splitlines():
-        if not line.strip():
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if not parts:
-            continue
-        name = parts[0]
-        try:
-            age = int(parts[1]) if len(parts) > 1 and parts[1] else 12
-        except:
-            age = 12
-        phone = parts[2] if len(parts) > 2 else None
-        code = generate_code(prefix="P-")
-        p = Player(name=name, age=age, login_code=code, phone=phone)
-        db.add(p); db.flush()
-        created.append((name, code))
-    db.commit()
-    request.session["flash"] = f"Imported {len(created)} players."
-    return RedirectResponse("/instructor", status_code=303)
-
-# Instructor player detail
-@app.get("/instructor/player/{player_id}", response_class=HTMLResponse)
-def instructor_player_detail(request: Request, player_id: int, db: Session = Depends(get_db)):
-    instr = current_instructor(request, db)
-    if not instr:
-        return RedirectResponse("/", status_code=303)
-    p = db.get(Player, player_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Player not found")
-    metrics = db.execute(select(Metric).where(Metric.player_id == p.id).order_by(Metric.date.desc())).scalars().all()
-    notes = db.execute(select(Note).where(Note.player_id == p.id).order_by(Note.created_at.desc())).scalars().all()
-    drills = db.execute(select(Drill).order_by(Drill.created_at.desc())).scalars().all()
-    ctx = {"request": request, "player": p, "metrics": metrics, "notes": notes, "drills": drills}
     return templates.TemplateResponse("instructor_player_detail.html", ctx)
 
-# Add metric (instructor only)
-@app.post("/metrics/add")
+
+# ------------------------- Instructor actions (writes) -------------------------
+
+@app.post("/instructor/player/{player_id}/metric")
 def add_metric(
+    player_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
-    player_id: int = Form(...),
-    date: Optional[str] = Form(None),
-    exit_velocity: Optional[float] = Form(None),
-    launch_angle: Optional[float] = Form(None),
-    spin_rate: Optional[float] = Form(None),
+    metric: str = Form(...),
+    value: float = Form(...),
+    unit: Optional[str] = Form(None),
+    recorded_at: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    instr = current_instructor(request, db)
-    if not instr:
-        raise HTTPException(status_code=403, detail="Only instructors can add metrics")
-    p = db.get(Player, player_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Player not found")
-    dt = datetime.fromisoformat(date) if date else datetime.utcnow()
-    m = Metric(player_id=p.id, date=dt, exit_velocity=exit_velocity, launch_angle=launch_angle, spin_rate=spin_rate)
-    db.add(m); db.commit()
+    if not request.session.get("instructor_id"):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-    # Optional SMS notify
-    if p.phone and os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_FROM_NUMBER"):
-        base = os.getenv("BASE_URL", "http://localhost:8000")
-        body = f"Hit4Power update: New metrics posted for {p.name}. View: {base}"
-        background_tasks.add_task(send_text_async, p.phone, body)
+    player = db.get(Player, player_id)
+    if not player:
+        return JSONResponse({"ok": False, "error": "player_not_found"}, status_code=404)
 
-    return RedirectResponse(f"/instructor/player/{p.id}", status_code=303)
+    when = datetime.fromisoformat(recorded_at) if recorded_at else datetime.utcnow()
 
-# Add note (instructor only)
-@app.post("/notes/add")
+    m = Metric(
+        player_id=player_id,
+        metric=metric.strip().lower(),
+        value=value,
+        unit=(unit or "").strip().lower() or None,
+        recorded_at=when,
+        source="instructor",
+        entered_by_instructor_id=request.session.get("instructor_id"),
+    )
+    db.add(m)
+    db.commit()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/instructor/player/{player_id}/note")
 def add_note(
+    player_id: int,
     request: Request,
-    background_tasks: BackgroundTasks,
-    player_id: int = Form(...),
     text: str = Form(...),
-    share_with_player: Optional[bool] = Form(False),
-    text_player: Optional[bool] = Form(False),
+    shared: bool = Form(True),
+    kind: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    instr = current_instructor(request, db)
-    if not instr:
-        raise HTTPException(status_code=403, detail="Only instructors can add notes")
-    p = db.get(Player, player_id)
-    if not p:
-        raise HTTPException(status_code=404, detail="Player not found")
-    n = Note(player_id=p.id, instructor_id=instr.id, text=text.strip(), shared=bool(share_with_player))
-    db.add(n); db.commit()
+    if not request.session.get("instructor_id"):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-    # Optionally text the player
-    if text_player and p.phone and os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_FROM_NUMBER"):
-        background_tasks.add_task(send_text_async, p.phone, f"Coach note from {instr.name}: {text.strip()}")
+    n = Note(
+        player_id=player_id,
+        instructor_id=request.session.get("instructor_id"),
+        text=text.strip(),
+        shared=bool(shared),
+        kind=(kind or "").strip() or None,
+    )
+    db.add(n)
+    db.commit()
+    return JSONResponse({"ok": True})
 
-    return RedirectResponse(f"/instructor/player/{p.id}", status_code=303)
 
-# Assign drill
-@app.post("/drills/assign")
+@app.post("/instructor/player/{player_id}/assign_drill")
 def assign_drill(
+    player_id: int,
     request: Request,
-    player_id: int = Form(...),
     drill_id: int = Form(...),
     note: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    instr = current_instructor(request, db)
-    if not instr:
-        raise HTTPException(status_code=403, detail="Only instructors can assign drills")
-    da = DrillAssignment(player_id=player_id, instructor_id=instr.id, drill_id=drill_id, note=note or "")
-    db.add(da); db.commit()
-    return RedirectResponse(f"/instructor/player/{player_id}", status_code=303)
+    if not request.session.get("instructor_id"):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
 
-# Manage drills (simple add)
-@app.post("/drills/create")
-def create_drill(
-    request: Request,
-    title: str = Form(...),
-    description: Optional[str] = Form(None),
-    video_url: Optional[str] = Form(None),
-    db: Session = Depends(get_db),
-):
-    instr = current_instructor(request, db)
-    if not instr:
-        raise HTTPException(status_code=403, detail="Only instructors")
-    d = Drill(title=title.strip(), description=(description or "").strip(), video_url=(video_url or "").strip())
-    db.add(d); db.commit()
-    return RedirectResponse("/instructor", status_code=303)
+    a = DrillAssignment(
+        player_id=player_id,
+        instructor_id=request.session.get("instructor_id"),
+        drill_id=drill_id,
+        note=(note or "").strip() or None,
+        status="assigned",
+    )
+    db.add(a)
+    db.commit()
+    return JSONResponse({"ok": True})
 
-# ----- Templates: flash helper -----
-def pop_flash(request: Request) -> Optional[str]:
-    msg = request.session.get("flash")
-    if msg:
-        request.session.pop("flash")
-        return msg
-    return None
-templates.env.globals["pop_flash"] = pop_flash
 
+# ------------------------- Health check ---------------------------------------
+
+@app.get("/healthz")
+def healthz():
+    return PlainTextResponse("ok")
